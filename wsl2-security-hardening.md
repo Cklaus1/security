@@ -37,12 +37,14 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 27. [Sysmon for Linux (System Monitor)](#27-sysmon-for-linux-system-monitor)
 28. [Canarytokens (Tripwire Honeytokens)](#28-canarytokens-tripwire-honeytokens)
 29. [Pi-hole (Network-Level Ad/Tracker Blocking)](#29-pi-hole-network-level-adtracker-blocking)
-30. [WSL-Specific Hardening](#30-wsl-specific-hardening)
-31. [Verification Checklist](#31-verification-checklist)
-32. [Known WSL2 Limitations](#32-known-wsl2-limitations)
-33. [Log Sources Reference](#33-log-sources-reference)
-34. [Security Monitoring Script](#34-security-monitoring-script)
-35. [Useful Monitoring Commands](#35-useful-monitoring-commands)
+30. [External Log Forwarding](#30-external-log-forwarding)
+31. [Incident Response Playbook](#31-incident-response-playbook)
+32. [WSL-Specific Hardening](#32-wsl-specific-hardening)
+33. [Verification Checklist](#33-verification-checklist)
+34. [Known WSL2 Limitations](#34-known-wsl2-limitations)
+35. [Log Sources Reference](#35-log-sources-reference)
+36. [Security Monitoring Script](#36-security-monitoring-script)
+37. [Useful Monitoring Commands](#37-useful-monitoring-commands)
 
 ---
 
@@ -783,9 +785,11 @@ Key settings:
 | Setting | What it does |
 |---------|-------------|
 | `no-new-privileges` | Prevents processes in containers from gaining additional privileges via SUID/SGID |
-| `userns-remap` | Maps container root to a non-root user on the host |
+| `userns-remap` | Maps container root to a non-root user on the host (see note below) |
 | `live-restore` | Keeps containers running during daemon restarts |
 | `log-opts` | Prevents container logs from filling disk |
+
+> **WSL2 note on `userns-remap`:** This setting may not work correctly on all WSL2 configurations. After enabling, run `docker info 2>&1 | grep -i userns` and test a container with `docker run --rm alpine id`. If you see errors or warnings, remove the `userns-remap` line from `daemon.json` and rely on other container isolation instead: always run containers with `--user` flag, use `--read-only` filesystems, and drop all capabilities with `--cap-drop=ALL --cap-add=<only-what-you-need>`.
 
 ### Scan images for vulnerabilities
 
@@ -1714,9 +1718,11 @@ Traditional system inspection requires remembering dozens of commands (`ps`, `ne
 ### Installation
 
 ```bash
-# Add osquery repo
-apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 1484120AC4E9F8A1A577AEEE97A80C63C9D8B80B
-echo "deb [arch=amd64] https://pkg.osquery.io/deb deb main" > /etc/apt/sources.list.d/osquery.list
+# Add osquery repo (modern key method)
+curl -fsSL https://pkg.osquery.io/deb/pubkey.gpg \
+  | gpg --dearmor -o /etc/apt/trusted.gpg.d/osquery.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/osquery.gpg] https://pkg.osquery.io/deb deb main" \
+  > /etc/apt/sources.list.d/osquery.list
 apt update && apt install -y osquery
 ```
 
@@ -1990,10 +1996,11 @@ YARA-X is a ground-up Rust rewrite by VirusTotal (Google). It's faster, safer (n
 ### Installation
 
 ```bash
-# Download the latest release
+# Download the latest release (the .gz contains a tar archive with the 'yr' binary)
 curl -fsSL https://github.com/VirusTotal/yara-x/releases/download/v1.14.0/yara-x-v1.14.0-x86_64-unknown-linux-gnu.gz \
   -o /tmp/yara-x.gz
-cd /tmp && gunzip yara-x.gz && tar xf yara-x
+cd /tmp && gunzip yara-x.gz   # produces 'yara-x' (a tar archive)
+tar xf yara-x                 # extracts 'yr' binary
 mv yr /usr/local/bin/yr
 chmod +x /usr/local/bin/yr
 yr --version
@@ -2794,7 +2801,228 @@ Total: **~1,038,531 unique blocked domains**.
 
 ---
 
-## 30. WSL-Specific Hardening
+## 30. External Log Forwarding
+
+All the tools in this guide log locally. If an attacker gets root, they can wipe local logs to cover their tracks. Forwarding logs off-machine ensures you retain evidence even after a full compromise.
+
+### Option 1: Remote Syslog (simplest)
+
+Forward syslog to a remote server or cloud service:
+
+```bash
+# /etc/rsyslog.d/50-remote.conf
+# Forward all logs to a remote syslog server over TCP
+*.* @@remote-syslog-server:514
+
+# Or forward only security-relevant logs
+auth,authpriv.*     @@remote-syslog-server:514
+local6.*            @@remote-syslog-server:514
+```
+
+```bash
+systemctl restart rsyslog
+```
+
+Free/cheap remote syslog options:
+- **Papertrail** (free tier: 50 MB/month)
+- **Logtail** (free tier: 1 GB/month)
+- **Any VPS** running rsyslog or syslog-ng
+
+### Option 2: Wazuh to External Indexer
+
+If running Wazuh, configure Filebeat to ship to an external OpenSearch/Elasticsearch cluster instead of (or in addition to) the local indexer:
+
+```yaml
+# /etc/filebeat/filebeat.yml — add a second output
+output.elasticsearch:
+  hosts: ["https://remote-opensearch:9200"]
+  username: "filebeat"
+  password: "..."
+  ssl.certificate_authorities: ["/etc/filebeat/certs/ca.pem"]
+```
+
+### Option 3: Ship Key Logs to S3
+
+For minimal infrastructure, push critical logs to an S3 bucket (append-only with Object Lock):
+
+```bash
+# /etc/cron.hourly/ship-logs-s3
+#!/bin/bash
+BUCKET="s3://your-security-logs/$(hostname)/$(date +%Y/%m/%d)"
+LOGS="/var/log/auth.log /var/log/opencanary.log /var/ossec/logs/alerts/alerts.json"
+for log in $LOGS; do
+    [ -f "$log" ] && aws s3 cp "$log" "$BUCKET/$(basename $log)-$(date +%H).gz" --quiet
+done
+```
+
+Enable S3 Object Lock (WORM) so even with AWS credentials, logs can't be deleted during the retention period.
+
+### What to Forward (minimum)
+
+| Log | Why |
+|-----|-----|
+| `/var/log/auth.log` | Login attempts, sudo, SSH — first sign of brute force |
+| `/var/log/opencanary.log` | Honeypot triggers — high-signal alerts |
+| `/var/ossec/logs/alerts/alerts.json` | Wazuh correlated alerts |
+| `/var/log/syslog` (Sysmon events) | Process and network telemetry |
+| `/var/log/cmd-audit.log` | Command history — shows attacker activity |
+
+### Key Principle
+
+**If logs only exist on the machine being attacked, they're not logs — they're suggestions.** Even forwarding to a single external destination (a $5/month VPS running rsyslog, a free Papertrail account, or an S3 bucket) dramatically improves your ability to investigate after an incident.
+
+---
+
+## 31. Incident Response Playbook
+
+Your tools detect threats. This section tells you what to do when an alert fires.
+
+### Triage Priority
+
+| Alert Source | Severity | First Action |
+|-------------|----------|-------------|
+| OpenCanary trigger | **Critical** — zero false positives | Isolate: who/what connected? |
+| Canarytokens alert | **Critical** — someone accessed a decoy | Determine scope: what else did they touch? |
+| Wazuh level 10+ alert | **High** | Read the alert details, check source IP |
+| Falco: shell in container | **High** | Identify the container, check for breakout |
+| YARA-X: webshell/miner match | **High** | Quarantine the file, check how it arrived |
+| CrowdSec: IP banned | **Medium** | Review the attack pattern, check if it succeeded |
+| rkhunter/chkrootkit finding | **Medium** | Verify — may be false positive, but investigate |
+| ClamAV: infected file | **Medium** | Quarantine, trace the file's origin |
+| Sysmon: process from /tmp | **Medium** | Check parent process chain |
+| Lynis hardening index drop | **Low** | Review what changed since last audit |
+
+### Step-by-Step: Suspected Compromise
+
+**1. Confirm the alert is real**
+
+```bash
+# Check Wazuh alerts
+tail -20 /var/ossec/logs/alerts/alerts.json | jq '{rule: .rule.description, level: .rule.level, src: .srcip}'
+
+# Check OpenCanary
+cat /var/log/opencanary.log | jq 'select(.src_host != "127.0.0.1")'
+
+# Check Sysmon for suspicious processes
+grep 'sysmon.*EventID>1' /var/log/syslog | grep -iE '/tmp/|/dev/shm|curl.*\|.*sh' | tail -10
+```
+
+**2. Assess scope**
+
+```bash
+# Who is logged in right now?
+who && w
+
+# What processes are running from unusual locations?
+osqueryi "SELECT name, path, cmdline, uid FROM processes WHERE path NOT LIKE '/usr/%' AND path NOT LIKE '/opt/%' AND path NOT LIKE '/bin/%' AND path != '';"
+
+# Any new listening ports?
+ss -tlnp
+
+# Any new SSH authorized keys?
+osqueryi "SELECT * FROM authorized_keys;"
+
+# Any new cron jobs?
+osqueryi "SELECT * FROM crontab;"
+
+# Check for LD_PRELOAD hijacking
+osqueryi "SELECT pid, key, value FROM process_envs WHERE key = 'LD_PRELOAD';"
+```
+
+**3. Contain**
+
+```bash
+# Block a specific IP immediately
+ufw deny from <attacker-ip>
+
+# Or via CrowdSec (shares with community)
+cscli decisions add --ip <attacker-ip> --reason "manual ban - incident response"
+
+# If a container is compromised, stop it
+docker stop <container-name>
+
+# If SSH is the vector, kill the session
+pkill -u <compromised-user>
+
+# Revoke a specific SSH key
+# Remove the key from ~/.ssh/authorized_keys
+```
+
+**4. Preserve evidence**
+
+```bash
+# Snapshot current state BEFORE cleanup
+mkdir -p /tmp/ir-evidence-$(date +%Y%m%d)
+IR_DIR="/tmp/ir-evidence-$(date +%Y%m%d)"
+
+# Capture process list
+ps auxf > "$IR_DIR/processes.txt"
+
+# Capture network state
+ss -tlnp > "$IR_DIR/listening-ports.txt"
+ss -tnp > "$IR_DIR/active-connections.txt"
+
+# Capture recent logins
+last -50 > "$IR_DIR/logins.txt"
+
+# Copy relevant logs
+cp /var/log/auth.log "$IR_DIR/"
+cp /var/log/opencanary.log "$IR_DIR/" 2>/dev/null
+cp /var/log/syslog "$IR_DIR/"
+tail -1000 /var/ossec/logs/alerts/alerts.json > "$IR_DIR/wazuh-alerts.json" 2>/dev/null
+
+# Zeek network logs
+cp -r /opt/zeek/logs/current/ "$IR_DIR/zeek-logs/" 2>/dev/null
+
+# If you found a suspicious file, preserve it
+# cp /tmp/suspicious-file "$IR_DIR/" && sha256sum "$IR_DIR/suspicious-file" > "$IR_DIR/hashes.txt"
+```
+
+**5. Remediate**
+
+```bash
+# Remove malicious files
+rm /tmp/suspicious-file
+
+# Rotate compromised credentials
+# - SSH keys: generate new keypair, update authorized_keys everywhere
+# - .env keys: dotenvx rotate
+# - Database passwords: rotate and re-deploy
+
+# Update packages (attacker may have exploited a known CVE)
+apt update && apt upgrade -y
+
+# Re-run security audits
+lynis audit system
+rkhunter --check --skip-keypress
+chkrootkit
+yr scan /etc/yara-rules/suspicious.yar /tmp/ /dev/shm/ /var/tmp/ /home/
+```
+
+**6. Post-incident**
+
+- Review how the attacker got in (initial access vector)
+- Check if they established persistence (cron jobs, SSH keys, systemd services)
+- Verify external log forwarding captured the timeline (Section 30)
+- Update detection rules if the attack wasn't caught early enough
+- If fully compromised: export data, `wsl --unregister`, fresh install
+
+### Quick Reference Card
+
+```
+ALERT FIRES → Is it real? (check logs)
+           → YES → Who/what? (osquery, sysmon, zeek)
+                  → Block attacker (ufw/crowdsec)
+                  → Preserve evidence (snapshot logs)
+                  → Remove threat (kill process, delete file)
+                  → Rotate credentials
+                  → Post-mortem (how did they get in?)
+           → NO  → Tune the rule to reduce noise
+```
+
+---
+
+## 32. WSL-Specific Hardening
 
 ### Tighten Windows drive mount permissions
 
@@ -2855,45 +3083,66 @@ kernelCommandLine = apparmor=1 security=apparmor
 
 ---
 
-## 31. Verification Checklist
+## 33. Verification Checklist
 
 Run these after a fresh `wsl --shutdown` and reopen to confirm everything is working:
 
 ```bash
 echo "=== Firewall ==="
 ufw status verbose
+# Validate: should show "Status: active", "Default: deny (incoming), allow (outgoing)"
+ufw status | grep -q "Status: active" && echo "  PASS: firewall active" || echo "  FAIL: firewall not active"
 
 echo "=== AppArmor ==="
 cat /sys/module/apparmor/parameters/enabled
 aa-status | head -5
+# Validate: should show "Y" and at least some profiles in enforce mode
+[ "$(cat /sys/module/apparmor/parameters/enabled)" = "Y" ] && echo "  PASS: AppArmor enabled" || echo "  FAIL: AppArmor disabled — check .wslconfig kernelCommandLine"
 
 echo "=== Process Accounting ==="
 systemctl is-active acct
 
 echo "=== Command Logging ==="
-test -f /etc/profile.d/cmd-logger.sh && echo "cmd-logger: installed"
-test -f /etc/rsyslog.d/30-cmd-audit.conf && echo "rsyslog route: configured"
+test -f /etc/profile.d/cmd-logger.sh && echo "cmd-logger: installed" || echo "  FAIL: cmd-logger.sh missing"
+test -f /etc/rsyslog.d/30-cmd-audit.conf && echo "rsyslog route: configured" || echo "  FAIL: rsyslog route missing"
+test -f /var/log/cmd-audit.log && echo "  log file exists ($(wc -l < /var/log/cmd-audit.log) lines)" || echo "  log file not yet created"
 
 echo "=== Unattended Upgrades ==="
 systemctl is-active unattended-upgrades
+# Validate: check it's actually configured for security updates
+grep -q "Unattended-Upgrade::Allowed-Origins" /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null && echo "  PASS: security updates configured" || echo "  WARN: check /etc/apt/apt.conf.d/50unattended-upgrades"
 
 echo "=== User Account ==="
-whoami  # should NOT be root
-sudo -l 2>/dev/null | head -3
+whoami  # should NOT be root for daily use
+# Validate: check password policy tools
+command -v chage >/dev/null && echo "  chage: available" || echo "  WARN: chage not found"
+grep -q "^PASS_MAX_DAYS" /etc/login.defs && grep "PASS_MAX_DAYS" /etc/login.defs
 
 echo "=== SSH ==="
 if systemctl is-active ssh 2>/dev/null; then
   sshd -t && echo "sshd config: OK"
-  grep "PermitRootLogin" /etc/ssh/sshd_config.d/*.conf 2>/dev/null
-  grep "PasswordAuthentication" /etc/ssh/sshd_config.d/*.conf 2>/dev/null
-  systemctl is-active fail2ban 2>/dev/null && echo "fail2ban: active"
+  # Validate actual hardened values
+  SSHD_ROOT=$(sshd -T 2>/dev/null | grep "^permitrootlogin" | awk '{print $2}')
+  SSHD_PASS=$(sshd -T 2>/dev/null | grep "^passwordauthentication" | awk '{print $2}')
+  SSHD_PORT=$(sshd -T 2>/dev/null | grep "^port" | awk '{print $2}')
+  echo "  PermitRootLogin: $SSHD_ROOT $([ "$SSHD_ROOT" = "no" ] && echo 'PASS' || echo 'WARN')"
+  echo "  PasswordAuthentication: $SSHD_PASS $([ "$SSHD_PASS" = "no" ] && echo 'PASS' || echo 'WARN')"
+  echo "  Port: $SSHD_PORT $([ "$SSHD_PORT" != "22" ] && echo 'PASS (non-default)' || echo 'WARN (default port)')"
+  systemctl is-active fail2ban 2>/dev/null && echo "  fail2ban: active" || echo "  WARN: fail2ban not running"
 else
   echo "sshd: not running (OK if not needed)"
 fi
 
 echo "=== Kernel Hardening ==="
-sysctl kernel.randomize_va_space kernel.kptr_restrict kernel.dmesg_restrict 2>/dev/null
-sysctl net.ipv4.conf.all.rp_filter 2>/dev/null
+# Validate expected values, not just read them
+ASLR=$(sysctl -n kernel.randomize_va_space 2>/dev/null)
+KPTR=$(sysctl -n kernel.kptr_restrict 2>/dev/null)
+DMESG=$(sysctl -n kernel.dmesg_restrict 2>/dev/null)
+RPFILT=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)
+echo "  ASLR: $ASLR $([ "$ASLR" = "2" ] && echo 'PASS' || echo 'FAIL (should be 2)')"
+echo "  kptr_restrict: $KPTR $([ "$KPTR" = "2" ] && echo 'PASS' || echo 'WARN (should be 2)')"
+echo "  dmesg_restrict: $DMESG $([ "$DMESG" = "1" ] && echo 'PASS' || echo 'WARN (should be 1)')"
+echo "  rp_filter: $RPFILT $([ "$RPFILT" = "1" ] && echo 'PASS' || echo 'WARN (should be 1)')"
 
 echo "=== File Integrity ==="
 test -f /var/lib/aide/aide.db && echo "AIDE database: initialized" || echo "AIDE database: MISSING — run aideinit"
@@ -2901,12 +3150,19 @@ command -v debsums >/dev/null && echo "debsums: installed" || echo "debsums: not
 
 echo "=== Credential Permissions ==="
 test -d ~/.ssh && stat -c "%a %n" ~/.ssh ~/.ssh/id_* 2>/dev/null
+# Validate: .ssh should be 700, private keys 600
+SSH_PERM=$(stat -c "%a" ~/.ssh 2>/dev/null)
+[ "$SSH_PERM" = "700" ] && echo "  PASS: ~/.ssh is 700" || echo "  FAIL: ~/.ssh is $SSH_PERM (should be 700)"
 find ~/projects -name ".env.keys" -exec stat -c "%a %n" {} \; 2>/dev/null
 
 echo "=== Docker ==="
 if command -v docker >/dev/null 2>&1; then
   docker info --format '{{.SecurityOptions}}' 2>/dev/null
-  ls -la /var/run/docker.sock
+  SOCK_PERM=$(stat -c "%a" /var/run/docker.sock 2>/dev/null)
+  echo "  docker.sock permissions: $SOCK_PERM $([ "$SOCK_PERM" = "660" ] && echo 'PASS' || echo 'WARN (should be 660)')"
+  # Check daemon.json settings
+  test -f /etc/docker/daemon.json && echo "  daemon.json: present" || echo "  WARN: no daemon.json hardening"
+  grep -q "no-new-privileges" /etc/docker/daemon.json 2>/dev/null && echo "  no-new-privileges: set" || echo "  WARN: no-new-privileges not set"
 else
   echo "Docker: not installed"
 fi
@@ -2975,7 +3231,7 @@ ss -tlnp
 
 ---
 
-## 32. Known WSL2 Limitations
+## 34. Known WSL2 Limitations
 
 ### auditd does not work
 
@@ -3001,11 +3257,24 @@ The WSL2 kernel is shared with Windows. Certain sysctl keys may return `permissi
 
 ### Docker user namespace remapping
 
-`userns-remap` in Docker daemon config may not work correctly on all WSL2 configurations. Test after enabling and check `docker info` for warnings.
+`userns-remap` in Docker daemon config may not work correctly on all WSL2 configurations. After enabling in `/etc/docker/daemon.json`, test with:
+
+```bash
+systemctl restart docker
+docker info 2>&1 | grep -i userns
+docker run --rm alpine id    # should show non-root uid if remapping works
+```
+
+If it fails or shows warnings, remove `"userns-remap": "default"` from `daemon.json` and use per-container isolation instead:
+
+```bash
+# Run containers as non-root with minimal capabilities
+docker run --user 1000:1000 --cap-drop=ALL --cap-add=NET_BIND_SERVICE --read-only <image>
+```
 
 ---
 
-## 33. Log Sources Reference
+## 35. Log Sources Reference
 
 Complete inventory of log sources on this WSL2 system and what to look for in each.
 
@@ -3177,7 +3446,7 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 
 ---
 
-## 34. Security Monitoring Script
+## 36. Security Monitoring Script
 
 An automated monitoring script is installed at `/root/projects/security/scripts/security-monitor.sh`. It checks all log sources from Section 11 and produces a color-coded summary.
 
@@ -3198,7 +3467,7 @@ See the script source for details on all checks performed.
 
 ---
 
-## 35. Useful Monitoring Commands
+## 37. Useful Monitoring Commands
 
 ### Daily checks
 
@@ -3310,9 +3579,11 @@ grep 'sysmon.*CommandLine.*/tmp/' /var/log/syslog    # processes from temp dirs
 
 ---
 
-## Quick Install Script
+## Quick Install Script (Foundational Hardening)
 
-Copy and run this to apply all settings to a fresh WSL2 Ubuntu instance. Review before running.
+This script covers **foundational hardening only** (sections 1-5, 9-10, 29 — firewall, AppArmor, accounting, logging, sysctls, AIDE, Pi-hole). It does **not** install the monitoring/detection stack (sections 15-28: Lynis, CrowdSec, Falco, Trivy, ClamAV, OpenCanary, osquery, Zeek, YARA-X, Wazuh, Sysmon). Those tools require individual installation and configuration — see each section for instructions.
+
+Copy and run this to apply foundational settings to a fresh WSL2 Ubuntu instance. Review before running.
 
 ```bash
 #!/usr/bin/env bash
@@ -3321,26 +3592,26 @@ set -euo pipefail
 # --- Must run as root ---
 if [ "$EUID" -ne 0 ]; then echo "Run as root"; exit 1; fi
 
-echo "[1/6] Updating packages..."
+echo "[1/10] Updating packages..."
 apt update -qq
 
-echo "[2/6] Installing ufw..."
+echo "[2/10] Installing ufw..."
 apt install -y -qq ufw
 ufw default deny incoming
 ufw default allow outgoing
 ufw --force enable
 
-echo "[3/6] Installing AppArmor tools..."
+echo "[3/10] Installing AppArmor tools..."
 apt install -y -qq apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
 apt install -y -qq ubuntu-advantage-tools   # AppArmor profiles for Ubuntu Pro processes
 systemctl enable apparmor.service
 
-echo "[4/6] Installing process accounting..."
+echo "[4/10] Installing process accounting..."
 apt install -y -qq acct
 accton on
 systemctl enable acct.service
 
-echo "[5/6] Configuring shell command logging..."
+echo "[5/10] Configuring shell command logging..."
 cat > /etc/profile.d/cmd-logger.sh << 'SCRIPT'
 if [ -n "$BASH_VERSION" ] && [[ $- == *i* ]]; then
     _CMD_LOG_LAST=""
