@@ -22,13 +22,21 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 12. [Container / Docker Hardening](#12-container--docker-hardening)
 13. [Cron and Systemd Timer Auditing](#13-cron-and-systemd-timer-auditing)
 14. [Backup and Recovery](#14-backup-and-recovery)
-15. [Pi-hole (Network-Level Ad/Tracker Blocking)](#15-pi-hole-network-level-adtracker-blocking)
-16. [WSL-Specific Hardening](#16-wsl-specific-hardening)
-17. [Verification Checklist](#17-verification-checklist)
-18. [Known WSL2 Limitations](#18-known-wsl2-limitations)
-19. [Log Sources Reference](#19-log-sources-reference)
-20. [Security Monitoring Script](#20-security-monitoring-script)
-21. [Useful Monitoring Commands](#21-useful-monitoring-commands)
+15. [Lynis (Security Auditing)](#15-lynis-security-auditing)
+16. [Rootkit Detection (rkhunter / chkrootkit)](#16-rootkit-detection-rkhunter--chkrootkit)
+17. [CrowdSec (Intrusion Prevention)](#17-crowdsec-intrusion-prevention)
+18. [Falco (Runtime Threat Detection)](#18-falco-runtime-threat-detection)
+19. [Trivy (Container Vulnerability Scanning)](#19-trivy-container-vulnerability-scanning)
+20. [Microsoft Defender for Endpoint (EDR)](#20-microsoft-defender-for-endpoint-edr)
+21. [ClamAV (Antivirus Scanning)](#21-clamav-antivirus-scanning)
+22. [OpenCanary (Honeypot / Deception)](#22-opencanary-honeypot--deception)
+23. [Pi-hole (Network-Level Ad/Tracker Blocking)](#23-pi-hole-network-level-adtracker-blocking)
+24. [WSL-Specific Hardening](#24-wsl-specific-hardening)
+25. [Verification Checklist](#25-verification-checklist)
+26. [Known WSL2 Limitations](#26-known-wsl2-limitations)
+27. [Log Sources Reference](#27-log-sources-reference)
+28. [Security Monitoring Script](#28-security-monitoring-script)
+29. [Useful Monitoring Commands](#29-useful-monitoring-commands)
 
 ---
 
@@ -917,7 +925,779 @@ chmod 600 /mnt/c/Users/<username>/wsl-backup/ssh-keys/*
 
 ---
 
-## 15. Pi-hole (Network-Level Ad/Tracker Blocking)
+## 15. Lynis (Security Auditing)
+
+Lynis is a security auditing tool that scans your system and produces a hardening index (0-100) with specific recommendations. It checks file permissions, kernel parameters, authentication settings, network configuration, installed software, and more. Think of it as a security report card.
+
+### Install
+
+```bash
+apt install -y lynis
+```
+
+### Run a full audit
+
+```bash
+lynis audit system
+```
+
+The audit takes 1-2 minutes and produces a report with:
+- **Hardening index** — a score from 0 to 100
+- **Warnings** — issues that need immediate attention
+- **Suggestions** — improvements ranked by severity
+- **Tests performed** — every check that was run
+
+### Automate weekly audits
+
+```bash
+# Lynis installs a systemd timer by default
+systemctl enable lynis.timer
+systemctl start lynis.timer
+
+# Check when it's scheduled
+systemctl list-timers | grep lynis
+```
+
+Or run manually via cron with report logging:
+
+```bash
+echo '0 3 * * 0 root lynis audit system --quiet --logfile /var/log/lynis-report.log' > /etc/cron.d/lynis-weekly
+```
+
+### Review results
+
+```bash
+# View the last report
+cat /var/log/lynis.log
+
+# View just warnings and suggestions
+grep -E "warning|suggestion" /var/log/lynis-report.dat
+
+# Compare hardening index over time
+grep "hardening_index" /var/log/lynis-report.dat
+```
+
+### Log locations
+
+```
+/var/log/lynis.log              # detailed audit log
+/var/log/lynis-report.dat       # machine-readable report data
+```
+
+---
+
+## 16. Rootkit Detection (rkhunter / chkrootkit)
+
+Two complementary tools that scan for known rootkits, backdoors, and suspicious binaries. Running both gives a second opinion — they use different detection methods.
+
+### Install
+
+```bash
+apt install -y rkhunter chkrootkit
+```
+
+### Fix rkhunter default config
+
+The default Ubuntu config has a broken `WEB_CMD` setting:
+
+```bash
+sed -i 's|WEB_CMD="/bin/false"|WEB_CMD=""|' /etc/rkhunter.conf
+```
+
+### Initialize rkhunter baseline
+
+```bash
+# Create a baseline of current file properties (run after a clean install)
+rkhunter --propupd
+```
+
+### Run scans
+
+```bash
+# rkhunter — full scan (non-interactive)
+rkhunter --check --skip-keypress
+
+# chkrootkit — quick scan
+chkrootkit
+```
+
+### What they check
+
+| Check | rkhunter | chkrootkit |
+|-------|----------|------------|
+| Known rootkits (signatures) | Yes (370+) | Yes (70+) |
+| Modified system binaries | Yes | Yes |
+| Hidden files/processes | Yes | Yes (unhide) |
+| Network interfaces in promiscuous mode | Yes | Yes |
+| Suspicious kernel modules | Yes | No |
+| Suspicious startup files | Yes | No |
+| File property changes (permissions, size) | Yes | No |
+
+### Automate daily scans
+
+chkrootkit installs a systemd timer automatically. For rkhunter:
+
+```bash
+# Enable daily rkhunter check via cron
+echo 'CRON_DAILY_RUN="true"' >> /etc/default/rkhunter
+```
+
+### Update rkhunter signatures after system changes
+
+After installing or updating packages, update the baseline so rkhunter doesn't flag legitimate changes:
+
+```bash
+rkhunter --propupd
+```
+
+### Log locations
+
+```
+/var/log/rkhunter.log           # rkhunter scan results
+/var/log/chkrootkit/log.today   # chkrootkit daily results (if timer enabled)
+```
+
+---
+
+## 17. CrowdSec (Intrusion Prevention)
+
+CrowdSec is a modern, community-powered intrusion prevention system. It parses logs, detects attacks (brute force, port scanning, etc.), and blocks offending IPs. Unlike fail2ban, it shares threat intelligence across all CrowdSec users — if an IP is attacking someone else, it gets preemptively blocked on your machine.
+
+### Install
+
+```bash
+# Add the CrowdSec repository
+curl -s https://install.crowdsec.net | bash
+
+# Install CrowdSec + firewall bouncer (auto-blocks via iptables)
+apt install -y crowdsec crowdsec-firewall-bouncer-iptables
+```
+
+### How it works
+
+```
+Log sources (auth.log, syslog, etc.)
+    ↓
+CrowdSec agent (parses logs, detects patterns)
+    ↓
+Local API (stores decisions: "ban IP X for Y minutes")
+    ↓
+Firewall bouncer (applies bans to iptables)
+    ↓
+Community API (shares/receives threat intelligence)
+```
+
+### Auto-configured log sources
+
+CrowdSec auto-detects installed services during setup. On this system it monitors:
+
+| Source | What it detects |
+|--------|----------------|
+| SSH (auth.log) | Brute force, slow brute force, CVE-2024-6387, refused connections |
+| Linux (syslog) | General system attack patterns |
+| Postfix (mail.log) | Spam, relay abuse, HELO rejected |
+| Audit | Post-exploitation (rm, pkill, exec from network, SUID crash) |
+
+### Useful commands
+
+```bash
+# View active decisions (banned IPs)
+cscli decisions list
+
+# View alerts (detected attacks)
+cscli alerts list
+
+# View metrics (parsed lines, active scenarios)
+cscli metrics
+
+# View installed collections (detection rules)
+cscli collections list
+
+# Manually ban an IP
+cscli decisions add --ip 1.2.3.4 --duration 24h --reason "manual ban"
+
+# Unban an IP
+cscli decisions delete --ip 1.2.3.4
+
+# View bouncer status
+cscli bouncers list
+
+# Update threat intelligence and hub content
+cscli hub update
+cscli hub upgrade
+```
+
+### Add more detection scenarios
+
+```bash
+# Browse available collections
+cscli collections list -a
+
+# Install additional collections (example: nginx, if you run it)
+cscli collections install crowdsecurity/nginx
+
+# Install community blocklists
+cscli console enroll <your-key>   # register at https://app.crowdsec.net
+```
+
+### Configuration files
+
+```
+/etc/crowdsec/config.yaml                    # main config
+/etc/crowdsec/acquis.d/                      # log source configurations
+/etc/crowdsec/scenarios/                     # detection rules
+/etc/crowdsec/parsers/                       # log parsers
+/etc/crowdsec/local_api_credentials.yaml     # local API auth
+/var/log/crowdsec.log                        # CrowdSec agent log
+/var/log/crowdsec_api.log                    # local API log
+```
+
+### Verify
+
+```bash
+systemctl is-active crowdsec
+systemctl is-active crowdsec-firewall-bouncer
+cscli metrics
+```
+
+---
+
+## 18. Falco (Runtime Threat Detection)
+
+Falco monitors every syscall (system call) in real-time using eBPF and alerts when something suspicious happens. Unlike log-based tools that detect attacks after the fact, Falco catches them as they happen — including activity inside Docker containers.
+
+### Install
+
+```bash
+# Add Falco repository
+curl -s https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/falco.gpg
+echo "deb https://download.falco.org/packages/deb stable main" | tee /etc/apt/sources.list.d/falcosecurity.list
+apt update
+
+# Install with modern eBPF driver (no kernel headers needed)
+FALCO_DRIVER_CHOICE=modern_ebpf apt install -y falco
+```
+
+During installation, choose `Yes` for automatic ruleset updates and select the `modern_ebpf` driver.
+
+### How it works
+
+```
+Any process does anything (open file, network connect, exec, etc.)
+    ↓
+Kernel syscall
+    ↓
+Falco eBPF probe (hooks into kernel, zero overhead when no match)
+    ↓
+Rule engine (matches against ~100 default rules)
+    ↓
+Alert (syslog, stdout, file, webhook, gRPC)
+```
+
+### What it detects (default rules)
+
+| Category | Example rules |
+|----------|--------------|
+| **Container escape** | Shell spawned in container, write below /etc in container |
+| **Privilege escalation** | Non-sudo setuid, unexpected privilege gain |
+| **Sensitive file access** | Read of /etc/shadow, /etc/passwd, SSH keys |
+| **Suspicious processes** | Known mining binaries, shells from unexpected parents |
+| **Network** | Unexpected outbound connections, port scanning |
+| **Persistence** | Modified system binaries, new cron entries, systemd unit changes |
+| **Data exfiltration** | Bulk data reads, base64 encoding of files |
+
+### Useful commands
+
+```bash
+# Check if Falco is running
+systemctl status falco-modern-bpf
+
+# View Falco alerts live
+journalctl -u falco-modern-bpf -f
+
+# Test Falco detection (triggers "Read sensitive file" alert)
+cat /etc/shadow > /dev/null
+
+# Check Falco alerts in the log
+journalctl -u falco-modern-bpf --since "1 hour ago" --no-pager
+
+# List loaded rules
+falco --list
+
+# Validate rule syntax
+falco --validate /etc/falco/falco_rules.yaml
+```
+
+### Custom rules
+
+Add custom rules in `/etc/falco/falco_rules.local.yaml` (never edit the default rules file — it gets overwritten on updates):
+
+```yaml
+# Example: alert when anyone runs docker exec
+- rule: Docker Exec Detected
+  desc: Detect docker exec into a running container
+  condition: >
+    spawned_process and container and
+    proc.pname = "runc:[2:INIT]"
+  output: >
+    Docker exec detected (user=%user.name container=%container.name
+    command=%proc.cmdline)
+  priority: NOTICE
+  tags: [container, docker]
+```
+
+```bash
+# Reload rules after editing
+systemctl restart falco-modern-bpf
+```
+
+### Configuration
+
+```
+/etc/falco/falco.yaml                # main config (output destinations, log level)
+/etc/falco/falco_rules.yaml          # default rules (auto-updated, don't edit)
+/etc/falco/falco_rules.local.yaml    # custom rules (your overrides go here)
+/etc/falco/config.d/                 # additional config fragments
+```
+
+### WSL2 notes
+
+Falco uses the modern eBPF driver on WSL2, which works with the Microsoft-managed kernel (6.6.x). If Falco fails to start, check:
+
+```bash
+# Verify eBPF support
+journalctl -u falco-modern-bpf | grep -i error
+ls /sys/kernel/btf/vmlinux   # must exist for CO-RE eBPF
+```
+
+---
+
+## 19. Trivy (Container Vulnerability Scanning)
+
+Trivy scans Docker images, filesystems, and git repos for known vulnerabilities (CVEs), misconfigurations, and embedded secrets. If you're running Docker containers, this tells you which ones have known security holes.
+
+### Install
+
+```bash
+curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+```
+
+### Scan Docker images
+
+```bash
+# Scan an image for CVEs
+trivy image postgres:latest
+
+# Scan with only HIGH and CRITICAL severity
+trivy image --severity HIGH,CRITICAL postgres:latest
+
+# Scan all running container images
+docker ps --format '{{.Image}}' | sort -u | while read img; do
+  echo "=== Scanning: $img ==="
+  trivy image --severity HIGH,CRITICAL "$img"
+done
+```
+
+### Scan the local filesystem
+
+```bash
+# Scan current directory for vulnerabilities and secrets
+trivy fs .
+
+# Scan for embedded secrets (API keys, passwords)
+trivy fs --scanners secret /root/projects/
+```
+
+### Scan a git repo
+
+```bash
+trivy repo https://github.com/Cklaus1/security
+```
+
+### Output formats
+
+```bash
+# JSON output (for processing)
+trivy image --format json -o results.json postgres:latest
+
+# Table output (default, human-readable)
+trivy image --format table postgres:latest
+
+# SARIF output (for GitHub Security tab integration)
+trivy image --format sarif -o results.sarif postgres:latest
+```
+
+### Automate regular scans
+
+```bash
+# Weekly scan of all running Docker images
+cat > /etc/cron.d/trivy-scan << 'EOF'
+0 4 * * 0 root docker ps --format '{{.Image}}' | sort -u | xargs -I{} trivy image --severity HIGH,CRITICAL --quiet {} >> /var/log/trivy-scan.log 2>&1
+EOF
+```
+
+### Update vulnerability database
+
+Trivy auto-downloads the vulnerability database on first run. To update manually:
+
+```bash
+trivy image --download-db-only
+```
+
+### Log location
+
+```
+/var/log/trivy-scan.log         # weekly scan results (if cron configured)
+```
+
+---
+
+## 20. Microsoft Defender for Endpoint (EDR)
+
+Microsoft Defender for Endpoint (MDE) is the enterprise EDR (Endpoint Detection & Response) layer for WSL2. It installs on the **Windows side** as an MSI package and hooks into WSL2 to provide real-time antimalware scanning, behavioral threat detection, and centralized alerting — the main gap in the open-source-only stack.
+
+### What it adds
+
+The open-source tools in this guide (Falco, CrowdSec, AIDE, rkhunter) cover detection and prevention, but they all run locally with no centralized management. MDE adds:
+
+| Capability | Open-source stack | MDE adds |
+|-----------|------------------|----------|
+| File scanning | AIDE (periodic), rkhunter (rootkit signatures) | Real-time antimalware with cloud-delivered protection |
+| Runtime detection | Falco (syscall monitoring) | EDR behavioral detection backed by Microsoft's threat intelligence |
+| Network monitoring | Pi-hole (DNS), UFW (firewall) | Network traffic analysis, C2 detection |
+| Alerting | Local logs, security-monitor.sh | Centralized portal with cross-machine correlation |
+| Response | Manual investigation | Remote live response, process isolation, automated remediation |
+| Threat intelligence | CrowdSec community blocklists | Microsoft's global threat intelligence feed |
+
+### Requirements
+
+- **Microsoft Defender for Endpoint license** — requires Microsoft 365 E5, E5 Security, or Microsoft Defender for Business. **This is not free.**
+- Windows 10/11 with WSL2
+- WSL updated to latest version: `wsl --update` (from PowerShell)
+- Not supported on ARM64 processors
+
+### Install (Windows side)
+
+1. Open the [Microsoft Defender portal](https://security.microsoft.com)
+2. Navigate to **Settings** → **Endpoints** → **Onboarding**
+3. Select **"Windows Subsystem for Linux 2 (plug-in)"** as the deployment method
+4. Download the MSI installer
+5. Run the MSI on Windows (not inside WSL)
+
+Or via **PowerShell** (elevated):
+
+```powershell
+# Download from the Defender portal first, then:
+msiexec /i "path\to\wsl-mde-plugin.msi" /qn
+```
+
+### Verify
+
+After installation, it takes a few minutes for the plugin to instantiate and up to 30 minutes for the WSL2 instance to onboard.
+
+From **PowerShell**:
+
+```powershell
+# Check if the plugin is running
+Get-Service -Name "MDE-WSL" -ErrorAction SilentlyContinue
+```
+
+From **WSL2**:
+
+```bash
+# Test EDR detection (downloads a safe EICAR test file)
+# Download the test script from Microsoft:
+curl -o mde_linux_edr_diy.sh https://aka.ms/MDE-Linux-EDR-DIY
+chmod +x mde_linux_edr_diy.sh
+./mde_linux_edr_diy.sh
+```
+
+Check the [Microsoft Defender portal](https://security.microsoft.com) → **Incidents & alerts** to confirm the test alert appears.
+
+### Automatic updates
+
+Version 1.24.522.2 and later supports automatic updates through Windows Update. Earlier versions require manual MSI reinstallation.
+
+### If you don't have a license
+
+For personal machines without E5/Business licensing, the open-source stack provides comparable coverage:
+
+| MDE capability | Open-source equivalent |
+|---------------|----------------------|
+| Real-time file scanning | ClamAV (open-source antivirus, not covered in this guide) |
+| Behavioral EDR | Falco (syscall monitoring via eBPF) |
+| Threat intelligence | CrowdSec (community IP reputation) |
+| Rootkit detection | rkhunter + chkrootkit |
+| File integrity | AIDE |
+| Network monitoring | Pi-hole (DNS) + UFW (firewall) |
+
+The main gaps without MDE: no centralized alerting portal, no cross-machine correlation, and no Microsoft-backed threat intelligence. For a single developer WSL2 instance, the open-source stack is sufficient. For enterprise machines, MDE is the recommended addition.
+
+---
+
+## 21. ClamAV (Antivirus Scanning)
+
+ClamAV is the standard open-source antivirus engine for Linux. It detects trojans, viruses, malware, and other threats using signature-based scanning. While Linux malware is less common than Windows malware, ClamAV catches cross-platform threats (malicious attachments, infected downloads) and satisfies compliance requirements.
+
+### Installation
+
+```bash
+sudo apt install -y clamav clamav-daemon
+```
+
+### Initial Setup
+
+```bash
+# Stop the freshclam daemon to do an initial update
+sudo systemctl stop clamav-freshclam
+
+# Update virus definitions
+sudo freshclam
+
+# Restart the update daemon (auto-updates signatures)
+sudo systemctl start clamav-freshclam
+sudo systemctl enable clamav-freshclam
+
+# Start the scanning daemon
+sudo systemctl start clamav-daemon
+sudo systemctl enable clamav-daemon
+```
+
+### Usage
+
+```bash
+# Scan a specific directory
+clamscan -r /home
+
+# Scan and remove infected files
+clamscan -r --remove /tmp
+
+# Scan with the daemon (faster, uses in-memory signatures)
+clamdscan /home
+
+# Full system scan (skip /proc, /sys, /dev)
+clamscan -r --exclude-dir="^/proc|^/sys|^/dev|^/run" /
+```
+
+### Scheduled Scanning
+
+```bash
+# Add a daily scan via cron
+cat >> /etc/cron.daily/clamav-scan << 'CRON'
+#!/bin/bash
+LOG=/var/log/clamav/daily-scan.log
+clamscan -r --exclude-dir="^/proc|^/sys|^/dev|^/run" / -l "$LOG" 2>&1
+# Alert on findings
+FOUND=$(grep "Infected files:" "$LOG" | awk '{print $NF}')
+if [ "$FOUND" -gt 0 ]; then
+    echo "ClamAV found $FOUND infected file(s). Check $LOG" | logger -t clamav-alert
+fi
+CRON
+chmod +x /etc/cron.daily/clamav-scan
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/etc/clamav/clamd.conf` | Daemon configuration |
+| `/etc/clamav/freshclam.conf` | Signature update configuration |
+| `/var/log/clamav/freshclam.log` | Update log |
+| `/var/lib/clamav/` | Virus signature database |
+
+### Verification
+
+```bash
+# Check daemon status
+systemctl status clamav-daemon
+
+# Check signature freshness
+freshclam --version
+clamscan --version
+
+# Test with EICAR test file (harmless test signature)
+curl -o /tmp/eicar.com https://secure.eicar.org/eicar.com
+clamscan /tmp/eicar.com   # Should detect "Win.Test.EICAR_HDB-1"
+rm /tmp/eicar.com
+```
+
+---
+
+## 22. OpenCanary (Honeypot / Deception)
+
+OpenCanary is a lightweight honeypot daemon that creates fake services (SSH, FTP, MySQL, HTTP, Redis, Telnet, etc.) to detect unauthorized access attempts. Any connection to these decoy services is an immediate indicator of compromise — legitimate users have no reason to touch them.
+
+### How It Works
+
+```
+Attacker scans network → finds open ports (2222, 3306, 6379...)
+         ↓
+Connects to fake SSH/MySQL/Redis
+         ↓
+OpenCanary logs: source IP, credentials tried, service targeted
+         ↓
+Alert: someone is probing your network
+```
+
+The key insight: **zero false positives**. Real users never connect to honeypot services, so any activity is suspicious by definition.
+
+### Installation
+
+```bash
+# Create isolated Python environment
+python3 -m venv /opt/opencanary
+/opt/opencanary/bin/pip install opencanary
+
+# Generate default config
+mkdir -p /etc/opencanaryd
+cp /opt/opencanary/lib/python3.*/site-packages/opencanary/data/settings.json \
+   /etc/opencanaryd/opencanary.conf
+```
+
+### Configuration
+
+Edit `/etc/opencanaryd/opencanary.conf` to enable fake services on **non-conflicting ports**:
+
+```json
+{
+    "device.node_id": "wsl2-honeypot",
+    "ssh.enabled": true,
+    "ssh.port": 2222,
+    "ssh.version": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6",
+    "ftp.enabled": true,
+    "ftp.port": 2121,
+    "http.enabled": true,
+    "http.port": 8888,
+    "http.skin": "nasLogin",
+    "mysql.enabled": true,
+    "mysql.port": 3306,
+    "mysql.banner": "5.7.99-0ubuntu0.22.04.1",
+    "redis.enabled": true,
+    "redis.port": 6379,
+    "telnet.enabled": true,
+    "telnet.port": 2323,
+    "portscan.enabled": true,
+    "portscan.ignore_localhost": true,
+    "logger": {
+        "class": "PyLogger",
+        "kwargs": {
+            "handlers": {
+                "file": {
+                    "class": "logging.FileHandler",
+                    "filename": "/var/log/opencanary.log"
+                }
+            }
+        }
+    }
+}
+```
+
+> **Port selection:** Use ports that don't conflict with real services. If you run a real MySQL on 3306, move the honeypot MySQL to 13306. The goal is to present attractive-looking services an attacker would probe.
+
+### Systemd Service
+
+```bash
+cat > /etc/systemd/system/opencanary.service << 'EOF'
+[Unit]
+Description=OpenCanary Honeypot
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/opt/opencanary/bin/opencanaryd.pid
+User=root
+ExecStart=/opt/opencanary/bin/opencanaryd --start
+ExecStop=/opt/opencanary/bin/opencanaryd --stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable opencanary
+systemctl start opencanary
+```
+
+### Log Format
+
+OpenCanary logs JSON to `/var/log/opencanary.log`. Each event includes:
+
+```json
+{
+    "dst_host": "10.0.0.5",
+    "dst_port": 2222,
+    "logtype": 4002,
+    "node_id": "wsl2-honeypot",
+    "src_host": "10.0.0.99",
+    "src_port": 48230,
+    "logdata": {
+        "USERNAME": "admin",
+        "PASSWORD": "password123",
+        "REMOTEVERSION": "SSH-2.0-OpenSSH_8.2"
+    },
+    "utc_time": "2026-03-09 05:18:31.369347"
+}
+```
+
+Key log types:
+
+| logtype | Meaning |
+|---------|---------|
+| 4000 | SSH session opened |
+| 4002 | SSH login attempt |
+| 5001 | FTP login attempt |
+| 7001 | HTTP login attempt |
+| 8001 | MySQL login attempt |
+| 10001 | Redis command |
+| 6001 | Telnet login attempt |
+
+### Monitoring OpenCanary Alerts
+
+```bash
+# View recent honeypot triggers
+cat /var/log/opencanary.log | python3 -m json.tool
+
+# Watch for live alerts
+tail -f /var/log/opencanary.log | jq '.'
+
+# Count attacks by source IP
+cat /var/log/opencanary.log | jq -r '.src_host' | sort | uniq -c | sort -rn
+
+# Show all login attempts
+cat /var/log/opencanary.log | jq 'select(.logdata.USERNAME) | {time: .utc_time, src: .src_host, user: .logdata.USERNAME, service: .dst_port}'
+```
+
+### Verification
+
+```bash
+# Check service is running
+systemctl status opencanary
+
+# Verify listening ports
+ss -tlnp | grep twistd
+
+# Test (from the same machine or another machine)
+ssh -p 2222 admin@localhost        # Triggers SSH alert
+curl http://localhost:8888          # Triggers HTTP alert
+redis-cli -p 6379 PING             # Triggers Redis alert
+
+# Check alerts were logged
+tail -5 /var/log/opencanary.log | jq '.'
+```
+
+### Best Practices
+
+- **Don't expose honeypot ports to the internet** unless you specifically want to collect external attack data
+- **Alert on any activity** — all honeypot triggers are suspicious by definition
+- **Use realistic banners** — outdated-looking SSH/MySQL versions attract attackers
+- **Don't run on the same ports as real services** — honeypots complement, not replace, real services
+- **Review logs daily** — honeypot alerts are high-signal and require investigation
+
+---
+
+## 23. Pi-hole (Network-Level Ad/Tracker Blocking)
 
 Pi-hole acts as a DNS sinkhole, blocking ads, trackers, and malicious domains at the network level before they reach any application. It also provides a query log and web dashboard for DNS visibility.
 
@@ -1195,7 +1975,7 @@ Total: **~1,038,531 unique blocked domains**.
 
 ---
 
-## 16. WSL-Specific Hardening
+## 24. WSL-Specific Hardening
 
 ### Tighten Windows drive mount permissions
 
@@ -1256,7 +2036,7 @@ kernelCommandLine = apparmor=1 security=apparmor
 
 ---
 
-## 17. Verification Checklist
+## 25. Verification Checklist
 
 Run these after a fresh `wsl --shutdown` and reopen to confirm everything is working:
 
@@ -1315,6 +2095,33 @@ fi
 echo "=== Cron Access ==="
 test -f /etc/cron.allow && echo "cron.allow: $(cat /etc/cron.allow)" || echo "cron.allow: NOT SET (any user can create cron jobs)"
 
+echo "=== Lynis ==="
+command -v lynis >/dev/null && lynis --version || echo "lynis: not installed"
+
+echo "=== Rootkit Detection ==="
+command -v rkhunter >/dev/null && echo "rkhunter: installed" || echo "rkhunter: not installed"
+command -v chkrootkit >/dev/null && echo "chkrootkit: installed" || echo "chkrootkit: not installed"
+
+echo "=== CrowdSec ==="
+systemctl is-active crowdsec 2>/dev/null && echo "crowdsec: active" || echo "crowdsec: not running"
+systemctl is-active crowdsec-firewall-bouncer 2>/dev/null && echo "bouncer: active" || echo "bouncer: not running"
+cscli decisions list 2>/dev/null | head -5
+
+echo "=== Falco ==="
+systemctl is-active falco-modern-bpf 2>/dev/null && echo "falco: active (modern eBPF)" || echo "falco: not running"
+
+echo "=== Trivy ==="
+command -v trivy >/dev/null && trivy --version 2>/dev/null | head -1 || echo "trivy: not installed"
+
+echo "=== ClamAV ==="
+systemctl is-active clamav-daemon 2>/dev/null && echo "clamav-daemon: active" || echo "clamav-daemon: not running"
+systemctl is-active clamav-freshclam 2>/dev/null && echo "freshclam: active" || echo "freshclam: not running"
+clamscan --version 2>/dev/null | head -1
+
+echo "=== OpenCanary ==="
+systemctl is-active opencanary 2>/dev/null && echo "opencanary: active" || echo "opencanary: not running"
+ss -tlnp | grep twistd 2>/dev/null | awk '{print "  listening:", $4}'
+
 echo "=== Pi-hole ==="
 pihole status 2>/dev/null || echo "Pi-hole not installed"
 dig @127.0.0.1 ads.doubleclick.net +short 2>/dev/null | head -1
@@ -1328,7 +2135,7 @@ ss -tlnp
 
 ---
 
-## 18. Known WSL2 Limitations
+## 26. Known WSL2 Limitations
 
 ### auditd does not work
 
@@ -1358,7 +2165,7 @@ The WSL2 kernel is shared with Windows. Certain sysctl keys may return `permissi
 
 ---
 
-## 19. Log Sources Reference
+## 27. Log Sources Reference
 
 Complete inventory of log sources on this WSL2 system and what to look for in each.
 
@@ -1479,6 +2286,31 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 
 **Suspicious indicators:** cron jobs running as root that weren't configured by you, jobs executing scripts from `/tmp` or `/dev/shm`, new entries appearing in `/etc/cron.d/` or user crontabs.
 
+### Security Tools
+
+| Log | Format | What to check |
+|-----|--------|--------------|
+| `/var/log/lynis.log` | text | Security audit results — hardening index, warnings, suggestions |
+| `/var/log/lynis-report.dat` | text | Machine-readable audit data for trend analysis |
+| `/var/log/rkhunter.log` | text | Rootkit scan results — modified binaries, suspicious files |
+| `/var/log/chkrootkit/log.today` | text | chkrootkit daily scan results |
+| `/var/log/crowdsec.log` | text | CrowdSec agent — parsed logs, detected scenarios, decisions |
+| `/var/log/crowdsec_api.log` | text | CrowdSec local API — bouncer connections, alerts |
+| `journalctl -u falco-modern-bpf` | structured | Falco runtime alerts — syscall violations, container events |
+| `/var/log/trivy-scan.log` | text | Container vulnerability scan results (if cron configured) |
+| `/var/log/clamav/freshclam.log` | text | ClamAV signature update status |
+| `/var/log/clamav/daily-scan.log` | text | ClamAV daily scan results (if cron configured) |
+| `/var/log/opencanary.log` | JSON | Honeypot triggers — any activity here is suspicious |
+
+**Suspicious indicators:**
+- **Lynis**: Hardening index dropping between scans (something was weakened)
+- **rkhunter/chkrootkit**: Any rootkit detection (always investigate, may be false positive)
+- **CrowdSec**: Repeated alerts from same IP range, alerts on unusual ports
+- **Falco**: Shell in container, sensitive file reads, unexpected outbound connections, privilege escalation
+- **Trivy**: CRITICAL CVEs in running container images
+- **ClamAV**: Any "Infected files" count > 0 in scan results
+- **OpenCanary**: ALL entries are suspicious — any connection to honeypot services means someone is probing
+
 ### Systemd Journal (structured)
 
 | Command | What to check |
@@ -1489,7 +2321,7 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 
 ---
 
-## 20. Security Monitoring Script
+## 28. Security Monitoring Script
 
 An automated monitoring script is installed at `/root/projects/security/scripts/security-monitor.sh`. It checks all log sources from Section 11 and produces a color-coded summary.
 
@@ -1510,7 +2342,7 @@ See the script source for details on all checks performed.
 
 ---
 
-## 21. Useful Monitoring Commands
+## 29. Useful Monitoring Commands
 
 ### Daily checks
 
@@ -1561,6 +2393,40 @@ apt list --upgradable 2>/dev/null | grep -i security
 
 # Review unattended-upgrades log
 cat /var/log/unattended-upgrades/unattended-upgrades.log
+```
+
+### Security tool checks
+
+```bash
+# Lynis — run a full audit and check hardening score
+lynis audit system
+grep "hardening_index" /var/log/lynis-report.dat
+
+# Rootkit scans
+rkhunter --check --skip-keypress
+chkrootkit
+
+# CrowdSec — check for active bans and recent alerts
+cscli decisions list
+cscli alerts list --since 24h
+cscli metrics
+
+# Falco — check for runtime alerts
+journalctl -u falco-modern-bpf --since "24 hours ago" --no-pager | grep -i "notice\|warning\|error"
+
+# Trivy — scan all running container images
+docker ps --format '{{.Image}}' | sort -u | while read img; do
+  echo "=== $img ==="
+  trivy image --severity HIGH,CRITICAL --quiet "$img"
+done
+
+# ClamAV — scan home directory
+clamscan -r /home --infected --bell
+freshclam --version  # check signature freshness
+
+# OpenCanary — check honeypot alerts
+cat /var/log/opencanary.log | jq 'select(.logdata.USERNAME) | {time: .utc_time, src: .src_host, user: .logdata.USERNAME, port: .dst_port}'
+cat /var/log/opencanary.log | jq -r '.src_host' | sort | uniq -c | sort -rn  # attacks by source IP
 ```
 
 ---
