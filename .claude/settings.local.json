@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo lsof -i :53 2>&1)",
+      "Bash(ss -tulnp src :53)",
+      "Bash(sudo systemctl restart pihole-FTL && sleep 3 && grep -i 'CRIT\\\\|error\\\\|dnsmasq' /var/log/pihole/FTL.log | tail -5)",
+      "Bash(cd /root/projects/dotenvx && node -e \"const pkg = require\\('./package-lock.json'\\); console.log\\('eciesjs:', pkg.packages['node_modules/eciesjs']?.version\\); console.log\\('execa:', pkg.packages['node_modules/execa']?.version\\); console.log\\('dotenv:', pkg.packages['node_modules/dotenv']?.version\\)\")",
+      "Bash(curl -fsSL https://get.docker.com | sh 2>&1)",
+      "Bash(docker --version && docker compose version)",
+      "Bash(cd /root/projects/redamon && docker compose --profile tools build 2>&1 | tail -20)",
+      "Bash(cd /root/projects/redamon && docker compose up -d 2>&1)"
+    ]
+  }
+}
