@@ -4,9 +4,19 @@ Tested on Ubuntu 24.04 LTS (Noble) running on WSL2 kernel 6.6.x.
 
 This guide documents every step to harden a fresh WSL2 instance. Run all commands as root or prefix with `sudo`.
 
+The guide is split into three tiers. **Part 1 is the baseline** — do all of it. Parts 2 and 3 are pick-what-you-need based on your threat model.
+
+| Tier | What | Time | RAM overhead |
+|------|------|------|-------------|
+| **Part 1: Baseline** | Core OS hardening, every WSL2 instance should have this | ~15 min | Negligible |
+| **Part 2: Recommended** | High-value detection tools, pick based on what you run | ~30 min | ~200-500 MB |
+| **Part 3: Advanced** | Lab/SOC-grade stack, specialized use cases | ~60 min | 2-4 GB+ |
+
 ---
 
 ## Table of Contents
+
+### Part 1: Core Hardening (Baseline)
 
 1. [Prerequisites](#1-prerequisites)
 2. [Firewall (ufw)](#2-firewall-ufw)
@@ -22,21 +32,30 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 12. [Container / Docker Hardening](#12-container--docker-hardening)
 13. [Cron and Systemd Timer Auditing](#13-cron-and-systemd-timer-auditing)
 14. [Backup and Recovery](#14-backup-and-recovery)
+
+### Part 2: Recommended Monitoring (Pick What You Need)
+
 15. [Lynis (Security Auditing)](#15-lynis-security-auditing)
-16. [Rootkit Detection (rkhunter / chkrootkit)](#16-rootkit-detection-rkhunter--chkrootkit)
-17. [CrowdSec (Intrusion Prevention)](#17-crowdsec-intrusion-prevention)
-18. [Falco (Runtime Threat Detection)](#18-falco-runtime-threat-detection)
-19. [Trivy (Container Vulnerability Scanning)](#19-trivy-container-vulnerability-scanning)
-20. [Microsoft Defender for Endpoint (EDR)](#20-microsoft-defender-for-endpoint-edr)
+16. [Falco (Runtime Threat Detection)](#18-falco-runtime-threat-detection)
+17. [Trivy (Container Vulnerability Scanning)](#19-trivy-container-vulnerability-scanning)
+18. [Osquery (Endpoint Visibility)](#23-osquery-endpoint-visibility)
+19. [OpenCanary (Honeypot / Deception)](#22-opencanary-honeypot--deception)
+20. [Canarytokens (Tripwire Honeytokens)](#28-canarytokens-tripwire-honeytokens)
 21. [ClamAV (Antivirus Scanning)](#21-clamav-antivirus-scanning)
-22. [OpenCanary (Honeypot / Deception)](#22-opencanary-honeypot--deception)
-23. [Osquery (Endpoint Visibility)](#23-osquery-endpoint-visibility)
+22. [Microsoft Defender for Endpoint (EDR)](#20-microsoft-defender-for-endpoint-edr)
+
+### Part 3: Advanced / Specialized
+
+23. [CrowdSec (Intrusion Prevention)](#17-crowdsec-intrusion-prevention)
 24. [Zeek (Network Security Monitor)](#24-zeek-network-security-monitor)
 25. [YARA-X (Malware Pattern Matching)](#25-yara-x-malware-pattern-matching)
 26. [Wazuh (SIEM / XDR)](#26-wazuh-siem--xdr)
 27. [Sysmon for Linux (System Monitor)](#27-sysmon-for-linux-system-monitor)
-28. [Canarytokens (Tripwire Honeytokens)](#28-canarytokens-tripwire-honeytokens)
+28. [Rootkit Detection (rkhunter / chkrootkit)](#16-rootkit-detection-rkhunter--chkrootkit)
 29. [Pi-hole (Network-Level Ad/Tracker Blocking)](#29-pi-hole-network-level-adtracker-blocking)
+
+### Operational
+
 30. [External Log Forwarding](#30-external-log-forwarding)
 31. [Incident Response Playbook](#31-incident-response-playbook)
 32. [WSL-Specific Hardening](#32-wsl-specific-hardening)
@@ -46,7 +65,23 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 36. [Security Monitoring Script](#36-security-monitoring-script)
 37. [Useful Monitoring Commands](#37-useful-monitoring-commands)
 
+### Choosing Your Telemetry Model
+
+For a single WSL2 host, you don't need all the monitoring tools. Pick one model:
+
+| Model | Tools | Best for |
+|-------|-------|----------|
+| **Lightweight** | osquery + Falco | Developer workstations, minimal overhead |
+| **Enterprise-managed** | Defender for Endpoint (or Wazuh + Sysmon) | Corporate laptops, compliance |
+| **Lab / SOC** | osquery + Falco + Wazuh + Zeek | Security research, dedicated monitoring |
+
+Running osquery + Falco + Sysmon + Wazuh + Zeek simultaneously is possible but produces overlapping telemetry and significant resource usage. Choose deliberately.
+
 ---
+
+# Part 1: Core Hardening (Baseline)
+
+> **Do all of this.** These are fundamental OS hardening steps with negligible performance impact. Every WSL2 instance should have these configured.
 
 ## 1. Prerequisites
 
@@ -481,6 +516,8 @@ cat ~/.ssh/id_ed25519.pub | wsl -u <username> sh -c 'mkdir -p ~/.ssh && chmod 70
 ```
 
 ### Install fail2ban for brute force protection
+
+> **Note:** fail2ban handles simple SSH brute-force blocking. If you later install CrowdSec (Section 17), you don't need both — CrowdSec does everything fail2ban does plus community threat intelligence. Use fail2ban for standalone SSH blocking; use CrowdSec if you want broader log-based detection.
 
 ```bash
 apt install -y fail2ban
@@ -935,7 +972,21 @@ chmod 600 /mnt/c/Users/<username>/wsl-backup/ssh-keys/*
 
 ---
 
+---
+
+# Part 2: Recommended Monitoring / Part 3: Advanced
+
+> Sections 15-29 cover monitoring and detection tools. Each section is labeled with its tier:
+> - **Recommended** — high value, low overhead, good for any WSL2 instance
+> - **Advanced** — lab/SOC-grade, higher resource cost, specialized use cases
+>
+> See the [telemetry model table](#choosing-your-telemetry-model) in the TOC for guidance on which to combine.
+
+---
+
 ## 15. Lynis (Security Auditing)
+
+> **Tier: Recommended.** Low overhead, high signal. Run periodically to validate your hardening.
 
 Lynis is a security auditing tool that scans your system and produces a hardening index (0-100) with specific recommendations. It checks file permissions, kernel parameters, authentication settings, network configuration, installed software, and more. Think of it as a security report card.
 
@@ -998,7 +1049,9 @@ grep "hardening_index" /var/log/lynis-report.dat
 
 ## 16. Rootkit Detection (rkhunter / chkrootkit)
 
-Two complementary tools that scan for known rootkits, backdoors, and suspicious binaries. Running both gives a second opinion — they use different detection methods.
+> **Tier: Advanced.** Legacy signature-based scanners. They can occasionally catch issues but expect false positives and limited coverage against modern threats. If you already run Falco + AIDE + osquery, these add marginal value. Keep them as optional second-opinion checks, not central controls.
+
+Two tools that scan for known rootkits, backdoors, and suspicious binaries. Running both gives a second opinion — they use different detection methods.
 
 ### Install
 
@@ -1070,6 +1123,10 @@ rkhunter --propupd
 ---
 
 ## 17. CrowdSec (Intrusion Prevention)
+
+> **Tier: Advanced.** CrowdSec overlaps with fail2ban (Section 8). Use fail2ban for simple standalone SSH blocking. Use CrowdSec if you want broader log-based detection and community threat intelligence. You don't need both unless you explicitly want layered blocking.
+>
+> **WSL2 note:** The firewall bouncer uses iptables, but WSL2 networking is mediated by Windows. Blocking behavior should be tested carefully — the Windows firewall still matters for inbound connections. Verify bans actually take effect with `cscli decisions list` and test from an external machine.
 
 CrowdSec is a modern, community-powered intrusion prevention system. It parses logs, detects attacks (brute force, port scanning, etc.), and blocks offending IPs. Unlike fail2ban, it shares threat intelligence across all CrowdSec users — if an IP is attacking someone else, it gets preemptively blocked on your machine.
 
@@ -1173,6 +1230,8 @@ cscli metrics
 ---
 
 ## 18. Falco (Runtime Threat Detection)
+
+> **Tier: Recommended.** Best-in-class runtime detection. Low overhead, high signal, especially valuable if running Docker containers.
 
 Falco monitors every syscall (system call) in real-time using eBPF and alerts when something suspicious happens. Unlike log-based tools that detect attacks after the fact, Falco catches them as they happen — including activity inside Docker containers.
 
@@ -1284,6 +1343,8 @@ ls /sys/kernel/btf/vmlinux   # must exist for CO-RE eBPF
 
 ## 19. Trivy (Container Vulnerability Scanning)
 
+> **Tier: Recommended.** Essential if you run Docker containers. Lightweight CLI scanner with no daemon — just run it when you build or pull images.
+
 Trivy scans Docker images, filesystems, and git repos for known vulnerabilities (CVEs), misconfigurations, and embedded secrets. If you're running Docker containers, this tells you which ones have known security holes.
 
 ### Install
@@ -1363,6 +1424,8 @@ trivy image --download-db-only
 ---
 
 ## 20. Microsoft Defender for Endpoint (EDR)
+
+> **Tier: Recommended.** If your organization provides MDE licenses, this is the easiest way to get enterprise-grade EDR on WSL2 with zero Linux-side configuration.
 
 Microsoft Defender for Endpoint (MDE) is the enterprise EDR (Endpoint Detection & Response) layer for WSL2. It installs on the **Windows side** as an MSI package and hooks into WSL2 to provide real-time antimalware scanning, behavioral threat detection, and centralized alerting — the main gap in the open-source-only stack.
 
@@ -1446,6 +1509,8 @@ The main gaps without MDE: no centralized alerting portal, no cross-machine corr
 ---
 
 ## 21. ClamAV (Antivirus Scanning)
+
+> **Tier: Recommended.** Low-overhead scheduled scanner. Useful for compliance and catching cross-platform malware in downloads and shared directories.
 
 ClamAV is the standard open-source antivirus engine for Linux. It detects trojans, viruses, malware, and other threats using signature-based scanning. While Linux malware is less common than Windows malware, ClamAV catches cross-platform threats (malicious attachments, infected downloads) and satisfies compliance requirements.
 
@@ -1535,6 +1600,8 @@ rm /tmp/eicar.com
 
 ## 22. OpenCanary (Honeypot / Deception)
 
+> **Tier: Recommended.** Lightweight Python daemon with minimal resource usage. Any connection to a honeypot port is a high-fidelity alert — zero false positives from legitimate use.
+
 OpenCanary is a lightweight honeypot daemon that creates fake services (SSH, FTP, MySQL, HTTP, Redis, Telnet, etc.) to detect unauthorized access attempts. Any connection to these decoy services is an immediate indicator of compromise — legitimate users have no reason to touch them.
 
 ### How It Works
@@ -1580,10 +1647,10 @@ Edit `/etc/opencanaryd/opencanary.conf` to enable fake services on **non-conflic
     "http.port": 8888,
     "http.skin": "nasLogin",
     "mysql.enabled": true,
-    "mysql.port": 3306,
+    "mysql.port": 13306,
     "mysql.banner": "5.7.99-0ubuntu0.22.04.1",
     "redis.enabled": true,
-    "redis.port": 6379,
+    "redis.port": 16379,
     "telnet.enabled": true,
     "telnet.port": 2323,
     "portscan.enabled": true,
@@ -1708,6 +1775,8 @@ tail -5 /var/log/opencanary.log | jq '.'
 ---
 
 ## 23. Osquery (Endpoint Visibility)
+
+> **Tier: Recommended.** Low-overhead daemon (~50MB RAM) that provides powerful SQL-based endpoint visibility. Core component of the "Lightweight" telemetry model.
 
 Osquery turns your operating system into a SQL database. You can query running processes, open ports, installed packages, logged-in users, cron jobs, kernel modules, Docker containers, and hundreds of other system attributes using standard SQL. This makes security investigations, compliance checks, and fleet monitoring trivial.
 
@@ -1853,7 +1922,9 @@ For managing osquery across multiple machines, [Fleet](https://fleetdm.com/) pro
 
 ## 24. Zeek (Network Security Monitor)
 
-Zeek (formerly Bro) is a passive network traffic analyzer. It sits on a network interface, watches all traffic, and produces structured logs: every connection, DNS query, HTTP request, SSL certificate, file transfer, and more. It's the gold standard for network security monitoring and forensics.
+> **Tier: Advanced.** Zeek is best on a dedicated network sensor, VM, or host with a mirrored/bridged interface and meaningful traffic visibility. In WSL2 behind Windows NAT, network visibility is limited — Zeek only sees traffic to/from the WSL2 VM, not the full host network. Endpoint-focused tools (osquery, Falco, Sysmon) usually provide better ROI for a single WSL2 instance. Zeek is included here for users running WSL2 as a security lab or monitoring outbound traffic from containerized services.
+
+Zeek is a passive network traffic analyzer. It sits on a network interface, watches all traffic, and produces structured logs: every connection, DNS query, HTTP request, SSL certificate, file transfer, and more. It's the gold standard for network security monitoring and forensics.
 
 ### Why Zeek
 
@@ -1986,6 +2057,8 @@ Zeek automatically rotates logs hourly. Archived logs are stored in `/opt/zeek/l
 ---
 
 ## 25. YARA-X (Malware Pattern Matching)
+
+> **Tier: Advanced.** Useful for security research and malware analysis labs. Most developer workstations won't need custom YARA rules — ClamAV covers standard malware detection.
 
 YARA-X is the Rust rewrite of YARA, the industry-standard tool for identifying and classifying malware based on pattern matching rules. Security researchers write YARA rules to describe malware families, and YARA-X scans files or directories to find matches. Think of it as "grep for malware" — but with support for hex patterns, conditions, file metadata, and module-based analysis.
 
@@ -2122,6 +2195,8 @@ yr scan /opt/yara-rules/malware/ /path/to/scan/
 ---
 
 ## 26. Wazuh (SIEM / XDR)
+
+> **Tier: Advanced.** Wazuh is a full SIEM platform — indexer, manager, and dashboard. On a single WSL2 instance it consumes **2-3 GB of RAM** and significant disk. This is best suited for dedicated security labs or multi-host monitoring, not a normal developer WSL2 distro. For a single host, osquery + Falco provides most of the same visibility at a fraction of the cost. Install Wazuh only if you're building a lab, need compliance dashboards, or plan to monitor multiple machines.
 
 Wazuh is an open-source security platform that combines SIEM (Security Information and Event Management) and XDR (Extended Detection and Response). It collects logs from all your security tools, correlates events, detects threats, and provides a web dashboard for investigation. Think of it as the central nervous system that ties everything else together.
 
@@ -2288,6 +2363,8 @@ If resources are tight, you can stop the dashboard when not actively investigati
 
 ## 27. Sysmon for Linux (System Monitor)
 
+> **Tier: Advanced.** Sysmon overlaps significantly with Falco (both use eBPF for syscall tracing) and osquery (process/network visibility). The main reason to run Sysmon is if you're feeding into Wazuh (which has built-in Sysmon rule support) or if your SOC team standardizes on Sysmon across Windows and Linux. If you're already running Falco + osquery, Sysmon adds diminishing returns.
+
 Sysmon for Linux is Microsoft's system monitoring tool, ported from the Windows version. It uses eBPF to trace process creation, network connections, and file operations at the kernel level, logging everything with SHA256 hashes, parent process chains, and user context. This is the same tool used by SOC teams on Windows — now available for Linux.
 
 ### Why Sysmon
@@ -2434,6 +2511,8 @@ sysmon -c /etc/sysmon-config.xml
 
 ## 28. Canarytokens (Tripwire Honeytokens)
 
+> **Tier: Recommended.** Zero infrastructure required when using the free hosted service at canarytokens.org. Complements OpenCanary by detecting post-exploitation file/credential access.
+
 Canarytokens are digital tripwires — fake files, credentials, or URLs that alert you when someone accesses them. Unlike OpenCanary (which creates fake network services), canarytokens detect **post-exploitation activity**: an attacker who is already inside and browsing files, testing credentials, or exfiltrating data.
 
 ### How It Works
@@ -2525,6 +2604,8 @@ Both should be used together for defense in depth.
 
 ## 29. Pi-hole (Network-Level Ad/Tracker Blocking)
 
+> **Tier: Advanced.** Running Pi-hole inside WSL2 is clever but brittle. It requires static IP hacks, immutable resolv.conf, DNS proxy workarounds, and careful Windows-side DNS configuration. It is not the simplest or most robust way to do DNS filtering. Consider running Pi-hole on a separate device (Raspberry Pi, dedicated VM) or using a simpler DNS-level blocker like NextDNS (hosted, zero infrastructure). This section is included for users who specifically want Pi-hole inside their WSL2 instance.
+
 Pi-hole acts as a DNS sinkhole, blocking ads, trackers, and malicious domains at the network level before they reach any application. It also provides a query log and web dashboard for DNS visibility.
 
 ### The WSL2 port 53 problem
@@ -2573,7 +2654,7 @@ echo 'nameserver 127.0.0.1' > /etc/resolv.conf
 chattr +i /etc/resolv.conf  # immutable flag prevents WSL from overwriting
 ```
 
-> **Note:** The `chattr +i` immutable flag prevents **anything** from modifying `/etc/resolv.conf`, including `apt` and `systemd-resolved`. If you need to edit it later, remove the flag first with `chattr -i /etc/resolv.conf`, make your changes, then re-apply `chattr +i`.
+> **⚠ Warning:** The `chattr +i` immutable flag prevents **anything** from modifying `/etc/resolv.conf` — including `apt`, `systemd-resolved`, `dpkg`, and you. This will cause confusing errors during package installs or DNS troubleshooting if you forget it's set. Always run `chattr -i /etc/resolv.conf` before making DNS changes, then re-apply with `chattr +i`. If you'd rather avoid this, skip the immutable flag and accept that WSL may occasionally overwrite resolv.conf on restart (you can re-apply it in the wsl.conf boot command instead).
 
 > **Important:** Do NOT add a fallback like `1.1.1.1` — that would bypass Pi-hole for all queries when it's slow, defeating the purpose. If Pi-hole is down, fix Pi-hole.
 
@@ -3581,7 +3662,7 @@ grep 'sysmon.*CommandLine.*/tmp/' /var/log/syslog    # processes from temp dirs
 
 ## Quick Install Script (Foundational Hardening)
 
-This script covers **foundational hardening only** (sections 1-5, 9-10, 29 — firewall, AppArmor, accounting, logging, sysctls, AIDE, Pi-hole). It does **not** install the monitoring/detection stack (sections 15-28: Lynis, CrowdSec, Falco, Trivy, ClamAV, OpenCanary, osquery, Zeek, YARA-X, Wazuh, Sysmon). Those tools require individual installation and configuration — see each section for instructions.
+This script covers **foundational hardening only** (sections 1-5, 9-10 — firewall, AppArmor, accounting, logging, sysctls, AIDE). It does **not** install the monitoring/detection stack (sections 15-28) or Pi-hole (section 29). Those tools require individual installation and configuration — see each section for instructions.
 
 Copy and run this to apply foundational settings to a fresh WSL2 Ubuntu instance. Review before running.
 
@@ -3592,26 +3673,26 @@ set -euo pipefail
 # --- Must run as root ---
 if [ "$EUID" -ne 0 ]; then echo "Run as root"; exit 1; fi
 
-echo "[1/10] Updating packages..."
+echo "[1/8] Updating packages..."
 apt update -qq
 
-echo "[2/10] Installing ufw..."
+echo "[2/8] Installing ufw..."
 apt install -y -qq ufw
 ufw default deny incoming
 ufw default allow outgoing
 ufw --force enable
 
-echo "[3/10] Installing AppArmor tools..."
+echo "[3/8] Installing AppArmor tools..."
 apt install -y -qq apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
 apt install -y -qq ubuntu-advantage-tools   # AppArmor profiles for Ubuntu Pro processes
 systemctl enable apparmor.service
 
-echo "[4/10] Installing process accounting..."
+echo "[4/8] Installing process accounting..."
 apt install -y -qq acct
 accton on
 systemctl enable acct.service
 
-echo "[5/10] Configuring shell command logging..."
+echo "[5/8] Configuring shell command logging..."
 cat > /etc/profile.d/cmd-logger.sh << 'SCRIPT'
 if [ -n "$BASH_VERSION" ] && [[ $- == *i* ]]; then
     _CMD_LOG_LAST=""
@@ -3643,15 +3724,11 @@ EOF
 
 systemctl restart rsyslog
 
-echo "[6/10] Configuring wsl.conf..."
-STATIC_IP="172.31.95.250"
-cat > /etc/wsl.conf << EOF
+echo "[6/8] Configuring wsl.conf..."
+cat > /etc/wsl.conf << 'EOF'
 [boot]
 systemd=true
-command="apparmor_parser -r /etc/apparmor.d/ 2>/dev/null || true; ip addr add ${STATIC_IP}/20 dev eth0 2>/dev/null || true"
-
-[network]
-generateResolvConf = false
+command="apparmor_parser -r /etc/apparmor.d/ 2>/dev/null || true"
 
 [automount]
 options = "metadata,umask=077"
@@ -3661,60 +3738,7 @@ enabled = true
 appendWindowsPath = false
 EOF
 
-echo "[7/10] Configuring DNS for Pi-hole..."
-# Add static IP to eth0 now (wsl.conf boot command handles future boots)
-ip addr add ${STATIC_IP}/20 dev eth0 2>/dev/null || true
-
-# Disable systemd-resolved stub listener, point at Pi-hole
-ETH0_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-sed -i "s/#DNS=/DNS=${ETH0_IP}/" /etc/systemd/resolved.conf
-sed -i 's/#DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
-systemctl restart systemd-resolved
-
-# Create static resolv.conf pointing to Pi-hole on loopback
-rm -f /etc/resolv.conf
-echo 'nameserver 127.0.0.1' > /etc/resolv.conf
-chattr +i /etc/resolv.conf  # prevent WSL from overwriting
-
-echo "[8/10] Installing Pi-hole..."
-mkdir -p /etc/pihole
-cat > /etc/pihole/setupVars.conf << 'EOF'
-PIHOLE_INTERFACE=eth0
-QUERY_LOGGING=true
-INSTALL_WEB_SERVER=true
-INSTALL_WEB_INTERFACE=true
-LIGHTTPD_ENABLED=true
-CACHE_SIZE=10000
-DNS_FQDN_REQUIRED=true
-DNS_BOGUS_PRIV=true
-DNSMASQ_LISTENING=local
-WEBPASSWORD=                  # blank for unattended install — set with 'pihole setpassword' after install
-BLOCKING_ENABLED=true
-PIHOLE_DNS_1=1.1.1.1
-PIHOLE_DNS_2=1.0.0.1
-DNSSEC=false
-REV_SERVER=false
-EOF
-
-git clone --depth 1 https://github.com/pi-hole/pi-hole.git /opt/pi-hole
-bash /opt/pi-hole/"automated install/basic-install.sh" --unattended
-
-# Configure FTL to avoid WSL2 port 53 conflict on 10.255.255.254
-# NONE mode disables auto listen config; bind-interfaces + explicit addresses
-# avoid the WSL kernel DNS proxy
-pihole-FTL --config dns.listeningMode NONE
-pihole-FTL --config dns.interface eth0
-pihole-FTL --config misc.dnsmasq_lines "[\"bind-interfaces\", \"listen-address=${ETH0_IP}\", \"listen-address=127.0.0.1\", \"listen-address=${STATIC_IP}\"]"
-
-# Open firewall ports for Pi-hole
-ufw allow 53 comment "Pi-hole DNS"
-ufw allow 80/tcp comment "Pi-hole web UI"
-ufw allow 443/tcp comment "Pi-hole web UI HTTPS"
-
-# Restart to apply
-systemctl restart pihole-FTL
-
-echo "[9/10] Applying kernel hardening sysctls..."
+echo "[7/8] Applying kernel hardening sysctls..."
 cat > /etc/sysctl.d/99-hardening.conf << 'SYSCTL'
 kernel.randomize_va_space = 2
 fs.suid_dumpable = 0
@@ -3738,14 +3762,14 @@ net.ipv6.conf.all.accept_source_route = 0
 SYSCTL
 sysctl --system 2>/dev/null || true
 
-echo "[10/10] Installing file integrity monitoring..."
+echo "[8/8] Installing file integrity monitoring..."
 apt install -y -qq aide debsums
 aideinit 2>/dev/null || true
 test -f /var/lib/aide/aide.db.new && cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
 
 echo ""
 echo "============================================"
-echo " DONE — Linux-side configuration complete"
+echo " DONE — Foundational hardening complete"
 echo "============================================"
 echo ""
 echo "MANUAL STEPS REMAINING:"
@@ -3757,17 +3781,8 @@ echo "   kernelCommandLine = apparmor=1 security=apparmor"
 echo ""
 echo "2. From PowerShell, run:  wsl --shutdown"
 echo "3. Reopen WSL and verify:"
-echo "     aa-status && ufw status && pihole status"
-echo ""
-echo "4. Set a Pi-hole web admin password:"
-echo "     pihole setpassword"
-echo ""
-echo "5. Configure Windows DNS (elevated PowerShell):"
-echo "     Set-DnsClientServerAddress -InterfaceAlias \"Wi-Fi\" -ServerAddresses ${STATIC_IP}, 1.1.1.1"
-echo ""
-echo "6. Access Pi-hole admin at:"
-echo "     http://${STATIC_IP}/admin"
+echo "     aa-status && ufw status"
 echo ""
 ```
 
-> **Important:** The `.wslconfig` file must be created on the Windows side manually or via `/mnt/c/Users/<username>/.wslconfig`. It cannot be included in the script reliably because the Windows username must be known. The script prints the manual steps at the end. A `wsl --shutdown` and reopen is required for Pi-hole DNS and AppArmor to fully activate.
+> **Important:** The `.wslconfig` file must be created on the Windows side manually or via `/mnt/c/Users/<username>/.wslconfig`. It cannot be included in the script reliably because the Windows username must be known. A `wsl --shutdown` and reopen is required for AppArmor to fully activate. For Pi-hole setup, see Section 29 — it requires additional DNS configuration and is best done separately.
