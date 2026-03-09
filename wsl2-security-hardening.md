@@ -85,9 +85,10 @@ Running osquery + Falco + Sysmon + Wazuh + Zeek simultaneously is possible but p
 
 ## 1. Prerequisites
 
-Update the package index first:
+Update the package index first. If scripting these steps or running in an automated context, export `DEBIAN_FRONTEND=noninteractive` to prevent dpkg/debconf prompts from hanging:
 
 ```bash
+export DEBIAN_FRONTEND=noninteractive
 apt update
 ```
 
@@ -416,7 +417,8 @@ Ensure only the `sudo` group has access:
 ### Password policy
 
 ```bash
-apt install -y libpam-pwquality
+# Install FIRST, then overwrite config (avoids dpkg conffile prompt)
+DEBIAN_FRONTEND=noninteractive apt install -y libpam-pwquality
 
 # Configure password complexity
 cat > /etc/security/pwquality.conf << 'EOF'
@@ -430,8 +432,11 @@ EOF
 
 ### Account lockout after failed attempts
 
+> **Note:** On Ubuntu 24.04, `pam_faillock` is built into `libpam-modules` — no separate package install is needed. Just configure the file below.
+
 ```bash
-apt install -y libpam-faillock
+# libpam-faillock does not exist as a separate package on Ubuntu 24.04 (Noble)
+# pam_faillock is included in libpam-modules which is already installed
 ```
 
 Edit `/etc/security/faillock.conf`:
@@ -638,11 +643,14 @@ Detects unauthorized changes to system binaries, config files, and libraries. If
 ### AIDE (Advanced Intrusion Detection Environment)
 
 ```bash
-apt install -y aide
+DEBIAN_FRONTEND=noninteractive apt install -y aide
 
-# Initialize the database (takes a few minutes — checksums every monitored file)
-aideinit
-cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+# Initialize the database — checksums every monitored file
+# This is CPU-intensive. Duration depends on disk usage: ~10 min for a fresh install,
+# 30-60+ minutes on a system with 300GB+ used disk. It is not hung.
+# Run in background so you can continue with other steps:
+nohup bash -c 'aideinit && cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db && echo "AIDE init complete"' > /var/log/aide-init.log 2>&1 &
+echo "AIDE init running in background (PID $!). Check progress: tail -f /var/log/aide-init.log"
 ```
 
 ### Run a check
@@ -1249,6 +1257,15 @@ FALCO_DRIVER_CHOICE=modern_ebpf apt install -y falco
 
 During installation, choose `Yes` for automatic ruleset updates and select the `modern_ebpf` driver.
 
+> **Port conflict:** Falco's health webserver defaults to port 8765. If another process is already using that port, Falco will fail to start with `Runtime error: an error occurred while starting webserver`. Check with `ss -tlnp | grep 8765`. To change the port, create `/etc/falco/config.d/health-port.yaml`:
+>
+> ```yaml
+> webserver:
+>   listen_port: 8766
+> ```
+>
+> Then restart: `systemctl restart falco-modern-bpf`
+
 ### How it works
 
 ```
@@ -1517,21 +1534,23 @@ ClamAV is the standard open-source antivirus engine for Linux. It detects trojan
 ### Installation
 
 ```bash
-sudo apt install -y clamav clamav-daemon
+DEBIAN_FRONTEND=noninteractive apt install -y clamav clamav-daemon
 ```
 
 ### Initial Setup
 
+> **Note:** `clamav-daemon` will not start automatically after install — it requires virus signature databases to exist first. Run `freshclam` before starting the daemon, or it will fail silently and show as `inactive`.
+
 ```bash
 # Stop the freshclam daemon to do an initial update
-sudo systemctl stop clamav-freshclam
+systemctl stop clamav-freshclam
 
-# Update virus definitions
-sudo freshclam
+# Update virus definitions (must complete before daemon can start)
+freshclam
 
 # Restart the update daemon (auto-updates signatures)
-sudo systemctl start clamav-freshclam
-sudo systemctl enable clamav-freshclam
+systemctl start clamav-freshclam
+systemctl enable clamav-freshclam
 
 # Start the scanning daemon
 sudo systemctl start clamav-daemon
@@ -2228,6 +2247,8 @@ For a single WSL2 instance, all three components run on the same machine (single
 
 ### Installation
 
+> **Re-running the installer:** If `wazuh-install-files.tar` already exists (from a previous install or a cloned repo), the `--generate-config-files` step will refuse to run. Rename or remove the old tar first: `mv wazuh-install-files.tar wazuh-install-files.tar.bak`
+
 ```bash
 # Download install assistant and config
 curl -fsSO https://packages.wazuh.com/4.11/wazuh-install.sh
@@ -2615,9 +2636,19 @@ WSL2 runs a **kernel-level DNS proxy** on `10.255.255.254:53` (bound to the `lo`
 - `0.0.0.0` (wildcard) — fails because `10.255.255.254:53` already exists
 - `10.255.255.254` — directly conflicts with the WSL proxy
 
-The solution is to configure Pi-hole to bind **only** to specific addresses — `172.31.87.23` (eth0 dynamic), `172.31.95.250` (eth0 static), and `127.0.0.1` (loopback) — avoiding the WSL-owned address entirely. This requires using dnsmasq's `bind-interfaces` option with explicit `listen-address` directives.
+The solution is to configure Pi-hole to bind **only** to specific addresses — your eth0 dynamic IP, a static IP, and `127.0.0.1` (loopback) — avoiding the WSL-owned address entirely. This requires using dnsmasq's `bind-interfaces` option with explicit `listen-address` directives.
 
-A **static IP** (`172.31.95.250`) is added to eth0 at boot within the WSL2 subnet (`172.31.80.0/20`) so that Windows can route to it. This gives Windows a fixed DNS address that survives WSL restarts (the DHCP-assigned eth0 IP changes each time). The IP is chosen near the top of the subnet range to avoid DHCP conflicts.
+A **static IP** is added to eth0 at boot within the WSL2 subnet so that Windows can route to it. This gives Windows a fixed DNS address that survives WSL restarts (the DHCP-assigned eth0 IP changes each time). The IP is chosen near the top of the subnet range to avoid DHCP conflicts.
+
+> **Important: WSL2 subnets vary per machine.** The examples in this section use `172.31.80.0/20` with static IP `172.31.95.250`, but your subnet will likely be different. Discover yours first:
+>
+> ```bash
+> ip addr show eth0 | grep "inet "
+> # Example output: inet 172.23.170.225/20 ...
+> # Your subnet is 172.23.160.0/20, so pick a high static IP like 172.23.175.250
+> ```
+>
+> Replace all `172.31.x.x` addresses in this section with IPs from your actual subnet.
 
 Additionally, `systemd-resolved` runs a stub listener on `127.0.0.53:53` by default, which must also be disabled.
 
@@ -2646,7 +2677,16 @@ Add to `/etc/wsl.conf`:
 generateResolvConf = false
 ```
 
-**3. Create a static resolv.conf pointing to Pi-hole on loopback:**
+**3. Use a temporary upstream DNS for the install, then switch to Pi-hole after:**
+
+During Pi-hole installation, you need working DNS (for `git clone`, `apt install`, gravity list downloads). Point resolv.conf at an upstream resolver temporarily:
+
+```bash
+rm -f /etc/resolv.conf
+echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+```
+
+After Pi-hole is installed and verified working, switch to Pi-hole and lock the file:
 
 ```bash
 rm -f /etc/resolv.conf
