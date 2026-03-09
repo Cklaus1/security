@@ -30,13 +30,16 @@ This guide documents every step to harden a fresh WSL2 instance. Run all command
 20. [Microsoft Defender for Endpoint (EDR)](#20-microsoft-defender-for-endpoint-edr)
 21. [ClamAV (Antivirus Scanning)](#21-clamav-antivirus-scanning)
 22. [OpenCanary (Honeypot / Deception)](#22-opencanary-honeypot--deception)
-23. [Pi-hole (Network-Level Ad/Tracker Blocking)](#23-pi-hole-network-level-adtracker-blocking)
-24. [WSL-Specific Hardening](#24-wsl-specific-hardening)
-25. [Verification Checklist](#25-verification-checklist)
-26. [Known WSL2 Limitations](#26-known-wsl2-limitations)
-27. [Log Sources Reference](#27-log-sources-reference)
-28. [Security Monitoring Script](#28-security-monitoring-script)
-29. [Useful Monitoring Commands](#29-useful-monitoring-commands)
+23. [Osquery (Endpoint Visibility)](#23-osquery-endpoint-visibility)
+24. [Zeek (Network Security Monitor)](#24-zeek-network-security-monitor)
+25. [YARA-X (Malware Pattern Matching)](#25-yara-x-malware-pattern-matching)
+26. [Pi-hole (Network-Level Ad/Tracker Blocking)](#26-pi-hole-network-level-adtracker-blocking)
+27. [WSL-Specific Hardening](#27-wsl-specific-hardening)
+28. [Verification Checklist](#28-verification-checklist)
+29. [Known WSL2 Limitations](#29-known-wsl2-limitations)
+30. [Log Sources Reference](#30-log-sources-reference)
+31. [Security Monitoring Script](#31-security-monitoring-script)
+32. [Useful Monitoring Commands](#32-useful-monitoring-commands)
 
 ---
 
@@ -1697,7 +1700,418 @@ tail -5 /var/log/opencanary.log | jq '.'
 
 ---
 
-## 23. Pi-hole (Network-Level Ad/Tracker Blocking)
+## 23. Osquery (Endpoint Visibility)
+
+Osquery turns your operating system into a SQL database. You can query running processes, open ports, installed packages, logged-in users, cron jobs, kernel modules, Docker containers, and hundreds of other system attributes using standard SQL. This makes security investigations, compliance checks, and fleet monitoring trivial.
+
+### Why Osquery
+
+Traditional system inspection requires remembering dozens of commands (`ps`, `netstat`, `lsmod`, `last`, `find`, etc.) with different flags and output formats. Osquery normalizes everything into SQL tables — one language for all endpoint data. Scheduled queries run continuously and log changes, so you have a complete audit trail.
+
+### Installation
+
+```bash
+# Add osquery repo
+apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 1484120AC4E9F8A1A577AEEE97A80C63C9D8B80B
+echo "deb [arch=amd64] https://pkg.osquery.io/deb deb main" > /etc/apt/sources.list.d/osquery.list
+apt update && apt install -y osquery
+```
+
+### Configuration
+
+Write a security-focused config to `/etc/osquery/osquery.conf`:
+
+```json
+{
+  "options": {
+    "config_plugin": "filesystem",
+    "logger_plugin": "filesystem",
+    "logger_path": "/var/log/osquery",
+    "disable_logging": "false",
+    "schedule_splay_percent": "10",
+    "events_expiry": "3600",
+    "verbose": "false",
+    "worker_threads": "2",
+    "disable_events": "false",
+    "disable_audit": "false",
+    "audit_allow_config": "true"
+  },
+  "schedule": {
+    "logged_in_users": {
+      "query": "SELECT user, host, time, tty FROM logged_in_users;",
+      "interval": 300
+    },
+    "listening_ports": {
+      "query": "SELECT pid, port, protocol, address, path FROM listening_ports WHERE port != 0;",
+      "interval": 300
+    },
+    "open_sockets": {
+      "query": "SELECT pid, remote_address, remote_port, local_address, local_port FROM process_open_sockets WHERE remote_port != 0 AND remote_address != '127.0.0.1';",
+      "interval": 60
+    },
+    "crontab": {
+      "query": "SELECT * FROM crontab;",
+      "interval": 300
+    },
+    "suid_bin": {
+      "query": "SELECT * FROM suid_bin;",
+      "interval": 3600
+    },
+    "suspicious_processes": {
+      "query": "SELECT p.name, p.path, p.cmdline, p.uid, u.username FROM processes p LEFT JOIN users u ON p.uid = u.uid WHERE p.path NOT LIKE '/usr/%' AND p.path NOT LIKE '/bin/%' AND p.path NOT LIKE '/sbin/%' AND p.path NOT LIKE '/opt/%' AND p.path != '';",
+      "interval": 300
+    },
+    "authorized_keys": {
+      "query": "SELECT * FROM authorized_keys;",
+      "interval": 3600
+    },
+    "docker_containers": {
+      "query": "SELECT id, name, image, status, security_options FROM docker_containers;",
+      "interval": 300
+    },
+    "kernel_modules": {
+      "query": "SELECT name, size, status FROM kernel_modules WHERE status = 'Live';",
+      "interval": 3600
+    },
+    "file_events": {
+      "query": "SELECT target_path, action, md5, sha256, uid, time FROM file_events;",
+      "interval": 60
+    }
+  },
+  "file_paths": {
+    "etc": ["/etc/%%"],
+    "homes": ["/root/.ssh/%%", "/home/%/.ssh/%%"],
+    "binaries": ["/usr/bin/%%", "/usr/sbin/%%"],
+    "crontabs": ["/var/spool/cron/%%", "/etc/cron.d/%%"]
+  }
+}
+```
+
+### Start the Daemon
+
+```bash
+systemctl enable osqueryd
+systemctl start osqueryd
+```
+
+### Interactive Queries
+
+Use `osqueryi` for ad-hoc investigation:
+
+```bash
+# What's listening on the network?
+osqueryi "SELECT pid, port, protocol, address, p.name FROM listening_ports l JOIN processes p USING (pid) WHERE port != 0;"
+
+# Who is logged in?
+osqueryi "SELECT user, host, time, tty FROM logged_in_users;"
+
+# Find SUID binaries (privilege escalation targets)
+osqueryi "SELECT path, username FROM suid_bin s JOIN users u ON s.uid = u.uid;"
+
+# Show all Docker containers and their security options
+osqueryi "SELECT name, image, status, security_options FROM docker_containers;"
+
+# Find processes running from unusual locations
+osqueryi "SELECT name, path, cmdline, uid FROM processes WHERE path NOT LIKE '/usr/%' AND path NOT LIKE '/opt/%' AND path != '';"
+
+# Check for LD_PRELOAD hijacking
+osqueryi "SELECT pid, key, value FROM process_envs WHERE key = 'LD_PRELOAD';"
+
+# Find recently modified files in /etc
+osqueryi "SELECT path, mtime, uid FROM file WHERE directory = '/etc/' AND mtime > (strftime('%s','now') - 3600);"
+
+# List all authorized SSH keys
+osqueryi "SELECT username, key_file, key FROM authorized_keys;"
+
+# Check installed packages for a specific one
+osqueryi "SELECT name, version FROM deb_packages WHERE name LIKE '%ssh%';"
+```
+
+### Fleet (Optional — Centralized Management)
+
+For managing osquery across multiple machines, [Fleet](https://fleetdm.com/) provides a web UI and centralized query management. For a single WSL2 instance, the local `osqueryd` daemon with file logging is sufficient.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/etc/osquery/osquery.conf` | Main configuration and scheduled queries |
+| `/var/log/osquery/osqueryd.results.log` | Scheduled query results (JSON) |
+| `/var/log/osquery/osqueryd.INFO` | Daemon info log |
+| `/var/log/osquery/osqueryd.snapshots.log` | Point-in-time query snapshots |
+
+---
+
+## 24. Zeek (Network Security Monitor)
+
+Zeek (formerly Bro) is a passive network traffic analyzer. It sits on a network interface, watches all traffic, and produces structured logs: every connection, DNS query, HTTP request, SSL certificate, file transfer, and more. It's the gold standard for network security monitoring and forensics.
+
+### Why Zeek
+
+Firewalls tell you what was blocked. Zeek tells you what actually happened on the wire. It creates a complete record of network activity — who connected to what, which DNS names were resolved, what certificates were presented, what files were transferred. After a security incident, Zeek logs are often the most valuable forensic artifact.
+
+### Installation
+
+```bash
+# Add Zeek repository (Ubuntu 24.04)
+echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /' \
+  > /etc/apt/sources.list.d/zeek.list
+curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key \
+  | gpg --dearmor -o /etc/apt/trusted.gpg.d/zeek.gpg
+apt update && apt install -y zeek
+```
+
+### Configuration
+
+```bash
+# Add Zeek to PATH
+echo 'export PATH="/opt/zeek/bin:$PATH"' >> ~/.bashrc
+export PATH="/opt/zeek/bin:$PATH"
+
+# Configure the monitored interface
+cat > /opt/zeek/etc/node.cfg << 'EOF'
+[zeek]
+type=standalone
+host=localhost
+interface=eth0
+EOF
+
+# Define local networks
+cat > /opt/zeek/etc/networks.cfg << 'EOF'
+10.0.0.0/8          Private
+172.16.0.0/12       Private
+192.168.0.0/16      Private
+EOF
+```
+
+### Deploy and Start
+
+```bash
+# Deploy configuration and start
+zeekctl deploy
+
+# Check status
+zeekctl status
+```
+
+### Systemd Service (auto-start on boot)
+
+```bash
+cat > /etc/systemd/system/zeek.service << 'EOF'
+[Unit]
+Description=Zeek Network Security Monitor
+After=network.target
+
+[Service]
+Type=forking
+Environment="PATH=/opt/zeek/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/opt/zeek/bin/zeekctl deploy
+ExecStop=/opt/zeek/bin/zeekctl stop
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable zeek
+```
+
+### Log Output
+
+Zeek writes structured logs to `/opt/zeek/logs/current/`. Key log files:
+
+| Log File | Contents |
+|----------|----------|
+| `conn.log` | Every TCP/UDP/ICMP connection (source, dest, port, bytes, duration) |
+| `dns.log` | Every DNS query and response |
+| `http.log` | HTTP requests (method, URI, host, user-agent, response code) |
+| `ssl.log` | TLS/SSL connections (server name, certificate details) |
+| `x509.log` | Certificate details (issuer, subject, expiry) |
+| `files.log` | Files transferred over the network (MIME type, hash) |
+| `notice.log` | Zeek-generated alerts and notices |
+| `weird.log` | Protocol anomalies and violations |
+| `software.log` | Software versions detected on the network |
+| `ssh.log` | SSH connections and authentication |
+
+### Useful Queries
+
+```bash
+# Show all connections in the last hour
+cat /opt/zeek/logs/current/conn.log | zeek-cut ts id.orig_h id.resp_h id.resp_p proto service duration
+
+# Find DNS queries for suspicious domains
+cat /opt/zeek/logs/current/dns.log | zeek-cut ts query answers | grep -iE '(crypto|miner|evil|malware)'
+
+# Show all HTTP requests
+cat /opt/zeek/logs/current/http.log | zeek-cut ts host uri method status_code user_agent
+
+# Find SSL connections with expired or self-signed certs
+cat /opt/zeek/logs/current/ssl.log | zeek-cut ts server_name validation_status | grep -v 'ok'
+
+# Top talkers (most connections by source IP)
+cat /opt/zeek/logs/current/conn.log | zeek-cut id.orig_h | sort | uniq -c | sort -rn | head -20
+
+# Find large file transfers
+cat /opt/zeek/logs/current/conn.log | zeek-cut id.orig_h id.resp_h id.resp_p orig_bytes resp_bytes | awk '$4 > 1000000 || $5 > 1000000'
+
+# Show SSH connections
+cat /opt/zeek/logs/current/ssh.log | zeek-cut ts id.orig_h id.resp_h auth_success direction
+```
+
+### Log Rotation
+
+Zeek automatically rotates logs hourly. Archived logs are stored in `/opt/zeek/logs/<date>/` with gzip compression. The `current/` directory always has the active logs.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/opt/zeek/etc/node.cfg` | Interface and cluster configuration |
+| `/opt/zeek/etc/networks.cfg` | Local network definitions |
+| `/opt/zeek/share/zeek/site/local.zeek` | Site-specific policy scripts |
+| `/opt/zeek/logs/current/` | Active log directory |
+| `/opt/zeek/logs/<date>/` | Archived rotated logs |
+
+---
+
+## 25. YARA-X (Malware Pattern Matching)
+
+YARA-X is the Rust rewrite of YARA, the industry-standard tool for identifying and classifying malware based on pattern matching rules. Security researchers write YARA rules to describe malware families, and YARA-X scans files or directories to find matches. Think of it as "grep for malware" — but with support for hex patterns, conditions, file metadata, and module-based analysis.
+
+### Why YARA-X over YARA
+
+YARA-X is a ground-up Rust rewrite by VirusTotal (Google). It's faster, safer (no memory bugs), and fully compatible with existing YARA rules. It will eventually replace the original C-based YARA.
+
+### Installation
+
+```bash
+# Download the latest release
+curl -fsSL https://github.com/VirusTotal/yara-x/releases/download/v1.14.0/yara-x-v1.14.0-x86_64-unknown-linux-gnu.gz \
+  -o /tmp/yara-x.gz
+cd /tmp && gunzip yara-x.gz && tar xf yara-x
+mv yr /usr/local/bin/yr
+chmod +x /usr/local/bin/yr
+yr --version
+```
+
+### Writing Rules
+
+Create rules in `/etc/yara-rules/`:
+
+```bash
+mkdir -p /etc/yara-rules
+```
+
+Example rule file `/etc/yara-rules/suspicious.yar`:
+
+```yara
+rule reverse_shell {
+    meta:
+        description = "Detects reverse shell patterns"
+        severity = "critical"
+    strings:
+        $s1 = "/dev/tcp/" ascii
+        $s2 = "bash -i >& /dev/tcp" ascii
+        $s3 = "nc -e /bin/" ascii
+        $s4 = "mkfifo /tmp/" ascii
+    condition:
+        any of them
+}
+
+rule crypto_miner {
+    meta:
+        description = "Cryptocurrency miner indicators"
+        severity = "high"
+    strings:
+        $s1 = "stratum+tcp://" ascii
+        $s2 = "xmrig" ascii nocase
+        $s3 = "cryptonight" ascii nocase
+        $s4 = "hashrate" ascii nocase
+    condition:
+        2 of them
+}
+
+rule webshell {
+    meta:
+        description = "Generic webshell patterns"
+        severity = "critical"
+    strings:
+        $php1 = "eval($_" ascii
+        $php2 = "base64_decode($_" ascii
+        $php3 = "system($_" ascii
+        $php4 = "passthru(" ascii
+        $php5 = "shell_exec(" ascii
+        $php6 = "<?php" ascii
+    condition:
+        $php6 and 2 of ($php1, $php2, $php3, $php4, $php5)
+}
+```
+
+### Usage
+
+```bash
+# Scan a single file
+yr scan /etc/yara-rules/suspicious.yar /path/to/suspicious-file
+
+# Scan an entire directory recursively
+yr scan /etc/yara-rules/suspicious.yar /tmp/
+
+# Scan with multiple rule files
+yr scan /etc/yara-rules/ /tmp/
+
+# Scan and show matching strings
+yr scan /etc/yara-rules/suspicious.yar /tmp/ --print-strings
+```
+
+### Scheduled Scanning
+
+```bash
+cat > /etc/cron.daily/yara-scan << 'SCRIPT'
+#!/bin/bash
+LOG=/var/log/yara-scan.log
+RULES=/etc/yara-rules/suspicious.yar
+DIRS="/tmp /dev/shm /var/tmp /home /root"
+
+echo "=== YARA-X scan $(date) ===" >> "$LOG"
+for dir in $DIRS; do
+    [ -d "$dir" ] && yr scan "$RULES" "$dir" >> "$LOG" 2>&1
+done
+echo "=== scan complete ===" >> "$LOG"
+
+FOUND=$(grep -c "^[a-z_]* " "$LOG" 2>/dev/null || echo 0)
+if [ "$FOUND" -gt 0 ]; then
+    logger -t yara-scan "YARA-X found $FOUND matches. Check $LOG"
+fi
+SCRIPT
+chmod +x /etc/cron.daily/yara-scan
+```
+
+### Getting More Rules
+
+Community YARA rule repositories:
+
+- **YARA-Rules Project**: `git clone https://github.com/Yara-Rules/rules.git /opt/yara-rules`
+- **Signature-Base (Florian Roth)**: `git clone https://github.com/Neo23x0/signature-base.git /opt/signature-base`
+- **Awesome YARA**: curated list at `github.com/InQuest/awesome-yara`
+
+To use community rules:
+```bash
+yr scan /opt/yara-rules/malware/ /path/to/scan/
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `/usr/local/bin/yr` | YARA-X binary |
+| `/etc/yara-rules/` | Custom rule directory |
+| `/var/log/yara-scan.log` | Scan results log |
+
+---
+
+## 26. Pi-hole (Network-Level Ad/Tracker Blocking)
 
 Pi-hole acts as a DNS sinkhole, blocking ads, trackers, and malicious domains at the network level before they reach any application. It also provides a query log and web dashboard for DNS visibility.
 
@@ -1975,7 +2389,7 @@ Total: **~1,038,531 unique blocked domains**.
 
 ---
 
-## 24. WSL-Specific Hardening
+## 27. WSL-Specific Hardening
 
 ### Tighten Windows drive mount permissions
 
@@ -2036,7 +2450,7 @@ kernelCommandLine = apparmor=1 security=apparmor
 
 ---
 
-## 25. Verification Checklist
+## 28. Verification Checklist
 
 Run these after a fresh `wsl --shutdown` and reopen to confirm everything is working:
 
@@ -2122,6 +2536,18 @@ echo "=== OpenCanary ==="
 systemctl is-active opencanary 2>/dev/null && echo "opencanary: active" || echo "opencanary: not running"
 ss -tlnp | grep twistd 2>/dev/null | awk '{print "  listening:", $4}'
 
+echo "=== Osquery ==="
+systemctl is-active osqueryd 2>/dev/null && echo "osqueryd: active" || echo "osqueryd: not running"
+osqueryi --version 2>/dev/null | head -1
+
+echo "=== Zeek ==="
+/opt/zeek/bin/zeekctl status 2>/dev/null | grep -v Warning || echo "zeek: not running"
+ls /opt/zeek/logs/current/conn.log 2>/dev/null && echo "conn.log: present" || echo "conn.log: missing"
+
+echo "=== YARA-X ==="
+yr --version 2>/dev/null || echo "yara-x: not installed"
+ls /etc/yara-rules/*.yar 2>/dev/null && echo "rules: present" || echo "rules: missing"
+
 echo "=== Pi-hole ==="
 pihole status 2>/dev/null || echo "Pi-hole not installed"
 dig @127.0.0.1 ads.doubleclick.net +short 2>/dev/null | head -1
@@ -2135,7 +2561,7 @@ ss -tlnp
 
 ---
 
-## 26. Known WSL2 Limitations
+## 29. Known WSL2 Limitations
 
 ### auditd does not work
 
@@ -2165,7 +2591,7 @@ The WSL2 kernel is shared with Windows. Certain sysctl keys may return `permissi
 
 ---
 
-## 27. Log Sources Reference
+## 30. Log Sources Reference
 
 Complete inventory of log sources on this WSL2 system and what to look for in each.
 
@@ -2301,6 +2727,14 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 | `/var/log/clamav/freshclam.log` | text | ClamAV signature update status |
 | `/var/log/clamav/daily-scan.log` | text | ClamAV daily scan results (if cron configured) |
 | `/var/log/opencanary.log` | JSON | Honeypot triggers — any activity here is suspicious |
+| `/var/log/osquery/osqueryd.results.log` | JSON | Scheduled query results — process, port, and file changes |
+| `/var/log/osquery/osqueryd.snapshots.log` | JSON | Point-in-time system state snapshots |
+| `/opt/zeek/logs/current/conn.log` | TSV | Every network connection (source, dest, port, bytes, duration) |
+| `/opt/zeek/logs/current/dns.log` | TSV | Every DNS query and response |
+| `/opt/zeek/logs/current/http.log` | TSV | HTTP requests (host, URI, user-agent) |
+| `/opt/zeek/logs/current/ssl.log` | TSV | TLS connections and certificate validation |
+| `/opt/zeek/logs/current/notice.log` | TSV | Zeek-generated security alerts |
+| `/var/log/yara-scan.log` | text | YARA-X malware scan results |
 
 **Suspicious indicators:**
 - **Lynis**: Hardening index dropping between scans (something was weakened)
@@ -2310,6 +2744,9 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 - **Trivy**: CRITICAL CVEs in running container images
 - **ClamAV**: Any "Infected files" count > 0 in scan results
 - **OpenCanary**: ALL entries are suspicious — any connection to honeypot services means someone is probing
+- **Osquery**: New listening ports, processes from unusual paths, new authorized_keys entries, LD_PRELOAD set
+- **Zeek**: Connections to known-bad IPs, DNS queries for suspicious domains, SSL certificate errors, large data transfers
+- **YARA-X**: Any match on crypto miner, webshell, or reverse shell rules
 
 ### Systemd Journal (structured)
 
@@ -2321,7 +2758,7 @@ Complete inventory of log sources on this WSL2 system and what to look for in ea
 
 ---
 
-## 28. Security Monitoring Script
+## 31. Security Monitoring Script
 
 An automated monitoring script is installed at `/root/projects/security/scripts/security-monitor.sh`. It checks all log sources from Section 11 and produces a color-coded summary.
 
@@ -2342,7 +2779,7 @@ See the script source for details on all checks performed.
 
 ---
 
-## 29. Useful Monitoring Commands
+## 32. Useful Monitoring Commands
 
 ### Daily checks
 
@@ -2427,6 +2864,20 @@ freshclam --version  # check signature freshness
 # OpenCanary — check honeypot alerts
 cat /var/log/opencanary.log | jq 'select(.logdata.USERNAME) | {time: .utc_time, src: .src_host, user: .logdata.USERNAME, port: .dst_port}'
 cat /var/log/opencanary.log | jq -r '.src_host' | sort | uniq -c | sort -rn  # attacks by source IP
+
+# Osquery — ad-hoc endpoint queries
+osqueryi "SELECT pid, port, protocol, address, p.name FROM listening_ports l JOIN processes p USING (pid) WHERE port != 0;"
+osqueryi "SELECT name, path, cmdline FROM processes WHERE path NOT LIKE '/usr/%' AND path NOT LIKE '/opt/%' AND path != '';"
+osqueryi "SELECT * FROM authorized_keys;"
+osqueryi "SELECT pid, key, value FROM process_envs WHERE key = 'LD_PRELOAD';"
+
+# Zeek — network traffic analysis
+cat /opt/zeek/logs/current/conn.log | zeek-cut ts id.orig_h id.resp_h id.resp_p proto service duration
+cat /opt/zeek/logs/current/dns.log | zeek-cut ts query answers
+cat /opt/zeek/logs/current/conn.log | zeek-cut id.orig_h | sort | uniq -c | sort -rn | head -20  # top talkers
+
+# YARA-X — malware scanning
+yr scan /etc/yara-rules/suspicious.yar /tmp/ /dev/shm/ /var/tmp/
 ```
 
 ---
