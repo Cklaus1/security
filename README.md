@@ -2,6 +2,12 @@
 
 A defense-in-depth security toolkit for WSL2 (Ubuntu 24.04 LTS) covering hardening, monitoring, DNS-level threat blocking, and secrets management.
 
+## Video Walkthrough
+
+[![WSL2 Security Hardening](https://img.youtube.com/vi/nJDo2Pvr6Rc/maxresdefault.jpg)](https://youtu.be/nJDo2Pvr6Rc)
+
+**[WSL2 Security Hardening - 29 Tools Across 3 Tiers (Complete Guide)](https://youtu.be/nJDo2Pvr6Rc)** — 9-minute narrated overview of every tool in this guide.
+
 ## What's Included
 
 | Component | Description |

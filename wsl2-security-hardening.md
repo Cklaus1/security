@@ -2,6 +2,8 @@
 
 Tested on Ubuntu 24.04 LTS (Noble) running on WSL2 kernel 6.6.x.
 
+> **Video walkthrough:** [WSL2 Security Hardening - 29 Tools Across 3 Tiers](https://youtu.be/nJDo2Pvr6Rc) — narrated overview of every tool in this guide.
+
 This guide documents every step to harden a fresh WSL2 instance. Run all commands as root or prefix with `sudo`.
 
 The guide is split into three tiers. **Part 1 is the baseline** — do all of it. Parts 2 and 3 are pick-what-you-need based on your threat model.
